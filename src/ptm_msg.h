@@ -1,5 +1,9 @@
-/* Copyright 2013 Cumulus Networks, LLC.  All rights reserved. */
-
+/*********************************************************************
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * ptm_msg.[ch] deal with CSV encoded messages between PTMd and clients.
+ * Just a wrapper on top of lib/csv.[ch]
+ */
 #ifndef __PTM_MSG_H__
 #define __PTM_MSG_H__
 

@@ -1,5 +1,5 @@
 /*********************************************************************
- * Copyright 2013 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
  *
  * ptm_event.[ch] provide the glue between the lower-level protocols
  * that provide physical topology information (such as LLDP) and the

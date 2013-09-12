@@ -1,11 +1,9 @@
 /*********************************************************************
- * Copyright 2013 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
  *
  * Parse the ptm.conf file, perform topology validation and send
  * notification on topo pass, topo fail and interface down events.
- *
  */
-
 #include "ptm_conf.h"
 #include "log.h"
 #include "ptm_ctl.h"

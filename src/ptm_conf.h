@@ -1,5 +1,6 @@
-/* Copyright 2013 Cumulus Networks, LLC.  All rights reserved. */
-
+/*********************************************************************
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ */
 #ifndef __PTMCONF__H
 #define __PTMCONF__H
 

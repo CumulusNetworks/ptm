@@ -1,5 +1,8 @@
-/* Copyright 2013 Cumulus Networks, LLC.  All rights reserved. */
-
+/*********************************************************************
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * ptm_ctl.[ch]: create a unix socket and listen on it for requests.
+ */
 #ifndef _PTM_CTL_H_
 #define _PTM_CTL_H_
 

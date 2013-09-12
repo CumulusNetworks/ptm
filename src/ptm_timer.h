@@ -1,5 +1,8 @@
-/* Copyright 2013 Cumulus Networks, LLC.  All rights reserved. */
-
+/*********************************************************************
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * ptm_timer.[ch] implement small-scape timerfd timers for use within PTMD.
+ */
 #ifndef _PTM_TIMER_H_
 #define _PTM_TIMER_H_
 

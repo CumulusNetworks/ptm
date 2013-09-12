@@ -1,5 +1,11 @@
-/* Copyright 2013 Cumulus Networks, LLC.  All rights reserved. */
-
+/*********************************************************************
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * ptm_lldp.[ch] contain the code that interacts with LLDPD over
+ * the LLDPCTL interface, extract the required information,
+ * translate them to ptm_event_t abstraction, and call the
+ * registered callback for each notification.
+ */
 #ifndef _PTM_LLDP_H_
 #define _PTM_LLDP_H_
 

@@ -1,3 +1,8 @@
+/*********************************************************************
+ * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * ptm_timer.[ch] implement small-scape timerfd timers for use within PTMD.
+ */
 #include <sys/timerfd.h>
 #include <time.h>
 #include <stdint.h>
