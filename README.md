@@ -17,3 +17,9 @@ https://groups.google.com/forum/#!forum/ptmd-users
 ptmd-users@googlegroups.com
 
 To subscribe with out a Google account please email ptmd-users+subscribe@googlegroups.com
+
+
+### Presentations
+
+UKNOF26, London, 13th September 2013
+http://indico.uknof.org.uk/getFile.py/access?contribId=8&resId=0&materialId=slides&confId=28
