@@ -16,4 +16,4 @@ https://groups.google.com/forum/#!forum/ptmd-users
 
 ptmd-users@googlegroups.com
 
-To subscribe with out a Google account please email ptmd-users+subscribe@googlegroups.co,
+To subscribe with out a Google account please email ptmd-users+subscribe@googlegroups.com
