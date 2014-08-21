@@ -1,10 +1,8 @@
-/* Copyright 2013 Cumulus Networks Inc.  All rights reserved. */
-/* See License file for licenese. */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <assert.h>
 #include <sys/queue.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -40,6 +38,7 @@ struct _csv_t_ {
   int buflen;
   int csv_len;
   int pointer;
+  int num_recs;
 };
 
 
@@ -62,6 +61,7 @@ csv_init (csv_t *csv,
     }
   }
   memset(csv, 0, sizeof(csv_t));
+
   csv->buf = buf;
   csv->buflen = buflen;
   TAILQ_INIT(&(csv->records));
@@ -73,21 +73,11 @@ csv_clean (csv_t *csv)
 {
   csv_record_t *rec;
   csv_record_t *rec_n;
-  csv_field_t *fld;
-  csv_field_t *fld_n;
 
   rec = TAILQ_FIRST(&(csv->records));
   while (rec != NULL) {
     rec_n = TAILQ_NEXT(rec, next_record);
-    fld = TAILQ_FIRST(&(rec->fields));
-    while (fld != NULL) {
-      fld_n = TAILQ_NEXT(fld, next_field);
-      TAILQ_REMOVE(&(rec->fields), fld, next_field);
-      free(fld);
-      fld = fld_n;
-    }
-    TAILQ_REMOVE(&(csv->records), rec, next_record);
-    free(rec);
+    csv_remove_record(csv, rec);
     rec = rec_n;
   }
 }
@@ -146,11 +136,22 @@ csv_encode (csv_t *csv,
   char *buf = csv->buf;
   int len = csv->buflen;
   int pointer = csv->pointer;
-  char *str = buf + pointer;
+  char *str = NULL;
   int tlen = 0;
   char *col;
   csv_record_t *rec;
   csv_field_t *fld;
+
+  if (buf) {
+     str = buf + pointer;
+  } else {
+     /* allocate sufficient buffer */
+     str = (char *)malloc(csv->buflen);
+     if (!str) {
+        log_error("field str malloc failed\n");
+        return (NULL);
+     }
+  }
 
   va_start(list, count);
   rec = malloc(sizeof(csv_record_t));
@@ -161,6 +162,7 @@ csv_encode (csv_t *csv,
   csv_init_record(rec);
   rec->record = str;
   TAILQ_INSERT_TAIL(&(csv->records), rec, next_record);
+  csv->num_recs++;
 
   /**
    * Iterate through the fields passed as a variable list and add them
@@ -218,6 +220,155 @@ csv_encode_record (csv_t *csv,
 }
 
 void
+csv_serialize(csv_t *csv, char *msgbuf)
+{
+  csv_record_t *rec;
+  int offset = 0;
+
+  if (!csv || !msgbuf) return;
+
+  rec = csv_record_iter(csv);
+  while (rec != NULL) {
+    offset += sprintf(&msgbuf[offset], "%s", rec->record);
+    rec = csv_record_iter_next(rec);
+  }
+}
+
+void
+csv_remove_record (csv_t *csv, csv_record_t *rec)
+{
+  /* first check if rec belongs to this csv */
+  if(!csv_is_record_valid(csv, rec)){
+    log_error("rec not in this csv\n");
+    return;
+  }
+
+  TAILQ_REMOVE(&(csv->records), rec, next_record);
+  csv->num_recs--;
+  csv->csv_len -= rec->rec_len;
+  if (!csv->buf)
+    free(rec->record);
+  free(rec);
+}
+
+void
+csv_insert_record (csv_t *csv, csv_record_t *rec)
+{
+  /* first check if rec already in csv */
+  if(csv_is_record_valid(csv, rec)){
+    log_error("rec already in this csv\n");
+    return;
+  }
+
+  /* we can only insert records if no buf was supplied during csv init */
+  if (csv->buf) {
+    log_error("un-supported for this csv type - single buf detected\n");
+    return;
+  }
+
+  /* do we go beyond the max buf set for this csv ?*/
+  if ((csv->csv_len + rec->rec_len) > csv->buflen ) {
+    log_error("cannot insert - exceeded buf size\n");
+    return;
+  }
+
+  TAILQ_INSERT_TAIL(&(csv->records), rec, next_record);
+  csv->num_recs++;
+  csv->csv_len += rec->rec_len;
+}
+
+csv_record_t *
+csv_concat_record (csv_t *csv,
+		           csv_record_t *rec1,
+		           csv_record_t *rec2)
+{
+  char *curr;
+  char *ret, *field;
+  csv_field_t *fld;
+  csv_record_t *rec;
+
+  /* first check if rec1 and rec2 belong to this csv */
+  if(!csv_is_record_valid(csv, rec1) ||
+     !csv_is_record_valid(csv, rec2)) {
+    log_error("rec1 and/or rec2 invalid\n");
+    return (NULL);
+  }
+
+  /* we can only concat records if no buf was supplied during csv init */
+  if (csv->buf) {
+    log_error("un-supported for this csv type - single buf detected\n");
+    return (NULL);
+  }
+
+  /* create a new rec */
+  rec = malloc(sizeof(csv_record_t));
+  if (!rec) {
+    log_error("record malloc failed\n");
+    return (NULL);
+  }
+  csv_init_record(rec);
+
+  curr = (char *)calloc(1, csv->buflen);
+  if (!curr) {
+    log_error("field str malloc failed\n");
+    return (NULL);
+  }
+  rec->record = curr;
+
+  /* concat the record string */
+  ret = strstr(rec1->record, "\n");
+  if (!ret) {
+    log_error("rec1 str not properly formatted\n");
+    return (NULL);
+  }
+
+  snprintf(curr, (int)(ret - rec1->record + 1), "%s", rec1->record);
+  strcat(curr, ",");
+
+  ret = strstr(rec2->record, "\n");
+  if (!ret) {
+    log_error("rec2 str not properly formatted\n");
+    return (NULL);
+  }
+
+  snprintf((curr+strlen(curr)), (int)(ret - rec2->record + 1), "%s", rec2->record);
+  strcat(curr, "\n");
+  rec->rec_len = strlen(curr);
+
+  /* paranoia */
+  assert(csv->buflen >
+         (csv->csv_len - rec1->rec_len - rec2->rec_len + rec->rec_len));
+
+  /* encode fields in new record */
+  field = strpbrk(curr, ",");
+  while (field != NULL) {
+      ret = curr;
+      fld = malloc(sizeof(csv_field_t));
+      if (fld) {
+        TAILQ_INSERT_TAIL(&(rec->fields), fld, next_field);
+        fld->field = ret;
+        fld->field_len = ret-curr;
+      }
+      curr = field + 1;
+      field = strpbrk(curr, ",");
+  }
+  field = strstr(curr, "\n");
+  fld = malloc(sizeof(csv_field_t));
+  if (field && fld) {
+    fld->field = curr;
+    fld->field_len = field - curr;
+    TAILQ_INSERT_TAIL(&(rec->fields), fld, next_field);
+  }
+
+  /* now remove rec1 and rec2 and insert rec into this csv */
+  csv_remove_record(csv, rec1);
+  csv_remove_record(csv, rec2);
+  csv_insert_record(csv, rec);
+
+  return rec;
+}
+
+void
 csv_decode (csv_t *csv)
 {
   char *buf = csv->buf;
@@ -235,6 +386,7 @@ csv_decode (csv_t *csv)
     rec = malloc(sizeof(csv_record_t));
     csv_init_record(rec);
     TAILQ_INSERT_TAIL(&(csv->records), rec, next_record);
+    csv->num_recs++;
     rec->record = record;
     curr = record;
     field = strpbrk(curr, ",");
@@ -253,6 +405,24 @@ csv_decode (csv_t *csv)
     TAILQ_INSERT_TAIL(&(rec->fields), fld, next_field);
     record = strtok_r(NULL, "\n", &save1);
   }
+}
+
+int
+csv_is_record_valid(csv_t *csv, csv_record_t *in_rec)
+{
+  csv_record_t *rec;
+  int valid = 0;
+
+  rec = csv_record_iter(csv);
+  while (rec) {
+    if(rec == in_rec) {
+      valid = 1;
+      break;
+    }
+    rec = csv_record_iter_next(rec);
+  }
+
+  return valid;
 }
 
 void

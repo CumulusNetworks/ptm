@@ -1,40 +1,19 @@
 #!/usr/bin/env python
 
-# The MIT License (MIT)
-# 
-# Copyright (c) 2013 Cumulus Networks Inc.
-# 
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-# 
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-# 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-# 
-
 import socket
 import os, os.path
 import subprocess
 import csv
 import re
+import sys
 import StringIO
 from itertools import groupby
 import argparse
+import json
 
 PTM_EOF_LEN = 4
 PTM_HEADER_LEN = 10
-PTM_BRIEFSTATUS_LEN = 22
+
 ptm_msghdr_fieldnames = ('length', 'version')
 ptm_sockname = "\0/var/run/ptmd.socket"
 
@@ -71,91 +50,255 @@ class PtmClientError(Exception): pass
 class PtmClient(socket.socket):
     def __init__(self):
         try:
-            socket.socket.__init__(self, socket.AF_UNIX, socket.SOCK_STREAM)
-            self.connect(ptm_sockname)
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._sock.connect(ptm_sockname)
 
         except socket.error, (errno, string):
-            raise PtmClientError("socket err [%d]: %s\n" % (errno, string))
+            print "Service not running, unable to connect to server"
+            sys.exit(1)
 
-        self.setblocking(1)
+        self._sock.setblocking(1)
+        self._sock.settimeout(1)
 
-    #Get the initial brief status update
-    def ptm_get_brief_status (self, display=True, watch=False):
-        if display:
-            short_fmt = "%-8s %-8s"
-            print "----------------"
-            print  short_fmt % ("Port", "Status")
-            print "----------------"
+    def recv(self, bufsize, flags=False):
+        try:
+            return self._sock.recv(bufsize, flags)
+        except socket.timeout as errno:
+            print "Timed out waiting for socket read"
+            sys.exit(1)
 
-        self.setblocking(1)
+    def sendall(self, data):
+        return self._sock.sendall(data)
 
+    def setblocking(self, flags=True):
+        self._sock.setblocking(flags)
+
+    def settimeout(self, timeout):
+        self._sock.settimeout(timeout)
+
+    #dump json output
+    def ptm_get_json (self):
+
+        cmd = 'get-status detail'
+        self.sendall(cmd)
+
+        ptmstr = {}
+        self.settimeout(None)
         while True:
             data = self.recv(PTM_EOF_LEN)
-            if re.search("EOF", data):
+            if "EOF" in data:
                 break
-            data1 = self.recv(PTM_BRIEFSTATUS_LEN - PTM_EOF_LEN)
-            data = data + data1
-            output = data.split()
-            if display:
-                print short_fmt % (output[0], output[1])
-
-    #Now get the interesting CSV stuff
-    def ptm_get_dump_status (self, watch=False):
-
-        if not watch:
-            self.sendall('dump-status')
-        else:
-            self.setblocking(1)
-
-        ptmstat = {}
-        while True:
-            data = self.recv(PTM_EOF_LEN)
-            if re.search("EOF", data):
-                break
-            data1 = self.recv(PTM_HEADER_LEN - PTM_EOF_LEN)
-            data = data + data1
+            data = "".join([data, self.recv(PTM_HEADER_LEN - PTM_EOF_LEN)])
             f = StringIO.StringIO(data)
             reader = csv.DictReader(f, ptm_msghdr_fieldnames)
-            len = 0
-            for row in reader:
-                len = int(row['length'])
+            row = next(reader);
+            clen = int(row['length'])
+            data = self.recv(clen)
+            f = StringIO.StringIO(data)
+            reader = csv.DictReader(f)
+            ptmstr[row['port']] = [row for row in reader if 'port' in row]
+            # end for row loop
+        # dump into json
+        print json.dumps(ptmstr, indent=4)
+        # end while(true)
+
+    #Get debug info (default=lldp)
+    def ptm_get_debug (self, mod='lldp'):
+
+        cmd = "".join(['get-debug ', mod])
+        self.sendall(cmd)
+
+        ptmstr = {}
+        colwidth = {}
+        self.settimeout(None)
+        rownum = 0
+        while True:
+            data = self.recv(PTM_EOF_LEN)
+            if "EOF" in data:
                 break
-            data = self.recv(len)
+            data = "".join([data, self.recv(PTM_HEADER_LEN - PTM_EOF_LEN)])
+            f = StringIO.StringIO(data)
+            reader = csv.DictReader(f, ptm_msghdr_fieldnames)
+            row = next(reader);
+            clen = int(row['length'])
+            data = self.recv(clen)
             f = StringIO.StringIO(data)
             reader = csv.DictReader(f)
             for row in reader:
-                ptmstat[row['port']] = [row['status'], row['expected nbr'], row['observed nbr'], row['last update']]
+                # read in row
+                if rownum == 0:
+                    # save the first row to print the header
+                    header = row
+                if 'port' in row:
+                    ptmstr[row['port']] = row
+                else:
+                    ptmstr[rownum] = row
 
-        link_stat = ptm_get_link_status()
+                # adjust col width size
+                for f in reader.fieldnames:
+                    # split multi-word column titles into 2 rows
+                    hsplit = f.split(" ",1)
+                    maxh = len(hsplit[0])
+                    if len(hsplit) > 1:
+                        maxh = max(len(hsplit[0]), len(hsplit[1]))
+                    if rownum == 0:
+                        colwidth[f] = max(maxh, len(row[f]))
+                    else:
+                        colwidth[f] = max(colwidth[f], max(maxh, len(row[f])))
+                # end for row loop
+                rownum = rownum+1
+        # end while(true)
+        if rownum == 0:
+          print "NULL Response from PTM - illegal command?"
+          sys.exit(1)
 
-        long_fmt = "%-6s %-6s %-20s %-20s %-10s"
-        print "---------------------------------------------------------------------"
-        print  long_fmt % ("Port", "Status", "Expected Nbr", "Observed Nbr", "Last Updated")
-        print "---------------------------------------------------------------------"
+        # print the row header
+        print "%s" % ("-" * 80)
+        for f in reader.fieldnames:
+          # split multi-word column titles into 2 rows
+          hsplit = f.split(" ",1)
+          print '%-*s ' % (colwidth[f], hsplit[0]),
+        print ""
+        for f in reader.fieldnames:
+          # split multi-word column titles into 2 rows
+          hsplit = f.split(" ",1)
+          if len(hsplit) > 1:
+            print '%-*s ' % (colwidth[f], hsplit[1]),
+          else:
+            print '%-*s ' % (colwidth[f], " "),
+        print ""
+        print "%s" % ("-" * 80)
+        # print the rows
 
-        for i in sorted(ptmstat, key=cmpfn):
+        if 'port' not in header:
+          for i in ptmstr:
+            for f in reader.fieldnames:
+              print '%-*s ' % (colwidth[f], ptmstr[i].get(f)),
+            print ""
+        else:
+            # per-port output
+          for i in sorted(ptmstr, key=cmpfn):
+            for f in reader.fieldnames:
+              print '%-*s ' % (colwidth[f], ptmstr[i].get(f)),
+            print ""
+
+    #Get the status update (default brief)
+    def ptm_get_status (self, detail=False):
+
+        if detail:
+            self.sendall('get-status detail')
+        else :
+            self.sendall('get-status')
+
+        ptmstr = {}
+        colwidth = {}
+        self.settimeout(None)
+        rownum = 0
+        while True:
+            data = self.recv(PTM_EOF_LEN)
+            if "EOF" in data:
+                break
+            data = "".join([data, self.recv(PTM_HEADER_LEN - PTM_EOF_LEN)])
+            f = StringIO.StringIO(data)
+            reader = csv.DictReader(f, ptm_msghdr_fieldnames)
+            row = next(reader);
+            clen = int(row['length'])
+            data = self.recv(clen)
+            f = StringIO.StringIO(data)
+            reader = csv.DictReader(f)
+            for row in reader:
+              # read in row
+              if rownum == 0:
+                # save the first row to print the header
+                header = row
+              if 'port' in row:
+                ptmstr[row['port']] = row
+              else:
+                ptmstr[rownum] = row
+              # adjust col width size (inside row loop)
+              for f in reader.fieldnames:
+                # split multi-word column titles into 2 rows
+                hsplit = f.split(" ",1)
+                maxh = len(hsplit[0])
+                if len(hsplit) > 1:
+                  maxh = max(len(hsplit[0]), len(hsplit[1]))
+                if rownum == 0:
+                  colwidth[f] = max(maxh, len(row[f]))
+                else:
+                  colwidth[f] = max(colwidth[f], max(maxh, len(row[f])))
+              # end for row loop
+            rownum = rownum+1
+        # end while(true)
+        if rownum == 0:
+          print "NULL Response from PTM - illegal command?"
+          sys.exit(1)
+
+        # print the row header
+        seplen = 0
+        for f in reader.fieldnames:
+            seplen += (colwidth[f]+len("  "))
+        print "%s" % ("-" * seplen)
+        for f in reader.fieldnames:
+          # split multi-word column titles into 2 rows
+          hsplit = f.split(" ",1)
+          print '%-*s ' % (colwidth[f], hsplit[0]),
+        print ""
+        for f in reader.fieldnames:
+          # split multi-word column titles into 2 rows
+          hsplit = f.split(" ",1)
+          if len(hsplit) > 1:
+            print '%-*s ' % (colwidth[f], hsplit[1]),
+          else:
+            print '%-*s ' % (colwidth[f], " "),
+        print ""
+        print "%s" % ("-" * seplen)
+        # print the rows
+        if 'port' not in header:
+          for i in ptmstr:
+            for f in reader.fieldnames:
+              print '%-*s ' % (colwidth[f], ptmstr[i].get(f)),
+            print ""
+        else:
+          # per-port output
+          link_stat = ptm_get_link_status()
+
+          for i in sorted(ptmstr, key=cmpfn):
             if i in link_stat:
-		if link_stat[i] is 'up':
-                	print long_fmt % (i, ptmstat[i][0], ptmstat[i][1], ptmstat[i][2], ptmstat[i][3])
-            	else:
-                	print long_fmt % (i, link_stat[i], ptmstat[i][1], ptmstat[i][2], ptmstat[i][3])
-	    else:
-                	print long_fmt % (i, "N/A", ptmstat[i][1], ptmstat[i][2], ptmstat[i][3])
+              if link_stat[i] is 'up':
+                for f in reader.fieldnames:
+                  print '%-*s ' % (colwidth[f], ptmstr[i].get(f)),
+              else:
+                for f in reader.fieldnames:
+                  if f == 'status':
+                    print '%-*s ' % (colwidth[f], "no-info"),
+                  else:
+                    print '%-*s ' % (colwidth[f], ptmstr[i].get(f)),
+            else:
+              # not in link_stat
+              for f in reader.fieldnames:
+                if f == 'status':
+                  print '%-*s ' % (colwidth[f], "N/A"),
+                else:
+                  print '%-*s ' % (colwidth[f], ptmstr[i].get(f)),
+            print ""
 
 parser = argparse.ArgumentParser(description='ptmctl arguments parser')
-parser.add_argument('-w', '--watch', help='monitor status change', action='store_true')
+parser.add_argument('-d', '--detail', help='print details', action='store_true')
+parser.add_argument('-b', '--bfd', help='print BFD details', action='store_true')
+parser.add_argument('-l', '--lldp', help='print LLDP details', action='store_true')
+parser.add_argument('-j', '--json', help='json output', action='store_true')
 
 args = parser.parse_args()
 
 c = PtmClient()
 
-# On connect, the brief status is always given, unconditionally
-c.ptm_get_brief_status(False)
-
-c.ptm_get_dump_status()
-
-# Brief status is default
-if args.watch:
-    c.ptm_get_dump_status(watch=True)
+if args.bfd:
+    c.ptm_get_debug(mod='bfd')
+elif args.lldp:
+    c.ptm_get_debug(mod='lldp')
+elif args.json:
+    c.ptm_get_json()
+else :
+    c.ptm_get_status(detail=args.detail)
 
 c.close()

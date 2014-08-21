@@ -14,7 +14,7 @@ enum log_level_e {
     LOG_LEVEL_LAST
 };
 
-bool log_init(const char **backends, int num_backends);
+bool logger_init(const char **backends, int num_backends);
 enum log_level_e log_string_to_level(const char *str);
 const char *log_level_to_string(enum log_level_e level);
 bool log_reopen(void);

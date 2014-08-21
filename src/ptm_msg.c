@@ -1,9 +1,3 @@
-/*********************************************************************
- * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
- *
- * ptm_msg.[ch] deal with CSV encoded messages between PTMd and clients.
- * Just a wrapper on top of lib/csv.[ch]
- */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

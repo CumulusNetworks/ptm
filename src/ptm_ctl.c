@@ -10,12 +10,15 @@
 #include <sys/un.h>
 #include "ptm_event.h"
 #include "log.h"
+#include "ptm_conf.h"
 #include "ptm_ctl.h"
 #include <sys/stat.h>
 
 /* listen() call's backlog */
 #define MAX_CONNECTIONS 10
 const char  PTMD_CTL_SOCKET[] = "\0/var/run/ptmd.socket";
+
+static int ptm_event_ctl (ptm_event_t *event);
 
 /**
  * Global structure (private to this file) for bookkeeping - init params,
@@ -46,13 +49,12 @@ _cleanup_client (int fd)
 
 static int
 _extract_event (ptm_event_t *ev,
-                ptm_client_t *client,
-                ptm_event_e type)
+                ptm_client_t *client)
 {
     if (!ev || !client) {
-        return (1);
+        return (-1);
     }
-    ev->type = type;
+    ev->type = EVENT_UPD;
     ev->module = CTL_MODULE;
     ev->client = client;
     return (0);
@@ -70,13 +72,14 @@ _accept_client (ptm_sockevent_e se)
         newfd = accept(PTM_MODULE_FD(g, CTL_MODULE), NULL, NULL);
         if (newfd < 0) {
             if (errno != EWOULDBLOCK) {
-                LOG("accept() failed (%s)\n", strerror(errno));
-                return (1);
+                ERRLOG("%s: accept() failed (%s)\n", __FUNCTION__,
+                    strerror(errno));
+                return (-1);
             }
             break;
         }
 
-        LOG("  New incoming connection - %d\n", newfd);
+        DLOG("  New incoming connection - %d\n", newfd);
 
         /* Set the fd to non-blocking mode. */
         fcntl(newfd, F_SETFL, O_NONBLOCK);
@@ -89,16 +92,12 @@ _accept_client (ptm_sockevent_e se)
         if (client == NULL) {
             ERRLOG("malloc error for client structure\n");
             _cleanup_client(newfd);
-            return (1);
+            return (-1);
         }
-        memset(client, 0, sizeof(client));
+        memset(client, 0, sizeof(ptm_client_t));
         client->fd = newfd;
         ptm_ctl.clients[newfd] = client;
         TAILQ_INSERT_TAIL(&(ptm_ctl.client_list), client, next);
-        if (PTM_MODULE_EVENTCB(ptm_ctl.gbl, CTL_MODULE)) {
-            _extract_event(&ptm_ctl.event, client, EVENT_ADD);
-            PTM_MODULE_EVENTCB(ptm_ctl.gbl, CTL_MODULE)(&ptm_ctl.event);
-        }
     } while (newfd != -1);
     return (0);
 }
@@ -111,36 +110,40 @@ _process_client (int in_fd,
     int close_conn = 0;
     int rc = 0;
 
-    assert(ptm_ctl.clients[in_fd] != NULL);
+    if(ptm_ctl.clients[in_fd] == NULL) {
+        ERRLOG("%s: no client for this fd=%d\n", __FUNCTION__, in_fd);
+        return -1;
+    }
+
     client = ptm_ctl.clients[in_fd];
 
+    printf("fd %d got %d\n", in_fd, se);
+
     if (se == SOCKEVENT_WRITE) {
-        DLOG("_process_client: SOCKEVENT_WRITE\n");
+        printf("_process_client: SOCKEVENT_WRITE\n");
         rc = ptm_ctl_send(client, NULL, 0);
         return (rc);
     }
 
     do {
-        rc = recv(in_fd, client->inbuf, CTL_MESSAGE_SIZE, 0);
+        rc = recv(in_fd, client->inbuf, CTL_MSG_SZ, 0);
         if (rc < 0) {
             if (errno != EWOULDBLOCK) {
-                LOG("  recv() failed (%s)\n", strerror(errno));
+                ERRLOG("  recv() failed (%s)\n", strerror(errno));
                 close_conn = 1;
             }
             break;
         }
         if (rc == 0) {
-            LOG("  Connection closed\n");
+            printf("  Connection closed\n");
             close_conn = 1;
             break;
         }
 
         client->inbuf_len = rc;
-        DLOG("  %d bytes received\n", client->inbuf_len);
-        if (PTM_MODULE_EVENTCB(ptm_ctl.gbl, CTL_MODULE)) {
-            _extract_event(&ptm_ctl.event, client, EVENT_UPD);
-            PTM_MODULE_EVENTCB(ptm_ctl.gbl, CTL_MODULE)(&ptm_ctl.event);
-        }
+        printf("  %d bytes received\n", client->inbuf_len);
+        _extract_event(&ptm_ctl.event, client);
+        ptm_module_handle_event_cb(&ptm_ctl.event);
     } while (1);
 
     if (close_conn) {
@@ -156,16 +159,14 @@ ptm_process_ctl (int in_fd,
 {
     ptm_globals_t *g = ptm_ctl.gbl;
 
-    LOG("%s\n", __FUNCTION__);
-
     /*
      * Is it coming on the listen socket?
      */
     if (in_fd == PTM_MODULE_FD(g, CTL_MODULE)) {
-        DLOG("  Listening socket is readable\n");
+        printf("  Listening socket is readable\n");
         _accept_client(se);
     } else {
-        DLOG("  Descriptor %d is readable\n", in_fd);
+        printf("  Descriptor %d is readable\n", in_fd);
         _process_client(in_fd, se);
     }
     return (0);
@@ -187,19 +188,25 @@ ptm_init_ctl (ptm_globals_t *g)
     ptm_ctl.gbl = g;
     TAILQ_INIT(&(ptm_ctl.client_list));
 
-    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+    /* init the callbacks */
+    PTM_MODULE_INITIALIZE(g, CTL_MODULE);
+    PTM_MODULE_PROCESSCB(g, CTL_MODULE) = ptm_process_ctl;
+    PTM_MODULE_EVENTCB(g, CTL_MODULE) = ptm_event_ctl;
+
+    flags = SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK;
+    if ((fd = socket(AF_UNIX, flags, 0)) == -1) {
         return (-1);
     }
 
     PTM_MODULE_SET_FD(g, fd, CTL_MODULE);
-    flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     /* Using abstract namespace socket */
-    //unlink(name);
     memset(&su, 0, sizeof(su));
     su.sun_family = AF_UNIX;
     memcpy(su.sun_path, PTMD_CTL_SOCKET, sizeof(PTMD_CTL_SOCKET));
+
+    printf("opening file %s\n", su.sun_path);
+//    unlink(su.sun_path);
 
     if (bind(fd, (struct sockaddr *)&su,
              sizeof(su.sun_family)+sizeof(PTMD_CTL_SOCKET)-1) == -1) {
@@ -237,10 +244,12 @@ ptm_ctl_send (ptm_client_t *client,
      */
     if (client->outbuf_len && buflen) {
         errno = EWOULDBLOCK;
+        ERRLOG("  Older data to be sent (%s)\n", strerror(errno));
         return (-1);
     }
 
     if (buflen) {
+        fprintf(stderr, "%s\n%d bytes\n", buf, buflen);
         memcpy(client->outbuf, buf, buflen);
         client->outbuf_len = buflen;
         client->pendingbuf = client->outbuf;
@@ -316,4 +325,22 @@ ptm_client_safe_iter_next (ptm_client_t **saved)
         *saved = TAILQ_NEXT(clnt, next);
     }
     return (clnt);
+}
+
+static int
+ptm_event_ctl (ptm_event_t *event)
+{
+    if (event == NULL) {
+        ERRLOG("%s: Null event received\n", __func__);
+        return FALSE;
+    }
+
+    if (event->type == EVENT_UPD) {
+        /* Process the client's query */
+        ptm_conf_process_client_query(event);
+    } else {
+        DLOG("%s: Ignoring non-UPD event (%d)\n", __func__, event->type);
+    }
+
+    return TRUE;
 }

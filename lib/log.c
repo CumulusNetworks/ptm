@@ -315,7 +315,7 @@ static bool log_backend_init(const char *str, log_backend_t *backend)
     return TRUE;
 }
 
-bool log_init(const char **strs, int num)
+bool logger_init(const char **strs, int num)
 {
     int i;
 

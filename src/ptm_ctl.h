@@ -1,17 +1,11 @@
-/*********************************************************************
- * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
- *
- * ptm_ctl.[ch]: create a unix socket and listen on it for requests.
- */
+/* Copyright 2013 Cumulus Networks, Inc.  All rights reserved. */
+
 #ifndef _PTM_CTL_H_
 #define _PTM_CTL_H_
 
 #include <sys/queue.h>
 
 extern const char PTMD_CTL_SOCKET[];
-#define CTL_MESSAGE_SIZE 4096
-
-#define PTM_CLIENT_FLAGS_DETAIL_MODE    (1 << 0)
 
 /**
  * Each connection made to the ptmd (server) unix socket is represented
@@ -20,22 +14,13 @@ extern const char PTMD_CTL_SOCKET[];
 struct _ptm_client_t_ {
     TAILQ_ENTRY(_ptm_client_t_) next;
     int                         fd;
-    char                        inbuf[CTL_MESSAGE_SIZE];
+    char                        inbuf[CTL_MSG_SZ];
     int                         inbuf_len;
-    char                        outbuf[CTL_MESSAGE_SIZE];
+    char                        outbuf[CTL_MSG_SZ];
     int                         outbuf_len;
     char                        *pendingbuf;
     uint32_t                    flags;
 };
-
-#define PTM_SET_CLIENT_DETAIL_MODE(client) \
-    (client)->flags |= PTM_CLIENT_FLAGS_DETAIL_MODE
-
-#define PTM_RESET_CLIENT_DETAIL_MODE(client) \
-    (client)->flags &= ~(PTM_CLIENT_FLAGS_DETAIL_MODE)
-
-#define PTM_CLIENT_DETAIL_MODE(client) \
-    ((client)->flags & PTM_CLIENT_FLAGS_DETAIL_MODE)
 
 /**
  * Hook up for ptm_event.c. Init routine to set up the control socket etc.

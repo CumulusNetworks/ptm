@@ -67,7 +67,8 @@ am__installdirs = "$(DESTDIR)$(sbindir)" "$(DESTDIR)$(sbindir)"
 PROGRAMS = $(sbin_PROGRAMS)
 am_ptmd_OBJECTS = ptm_lldp.$(OBJEXT) ptm_ctl.$(OBJEXT) \
 	ptm_event.$(OBJEXT) ptm_conf.$(OBJEXT) ptm_msg.$(OBJEXT) \
-	ptm_timer.$(OBJEXT)
+	ptm_timer.$(OBJEXT) ptm_bfd.$(OBJEXT) ptm_nbr.$(OBJEXT) \
+	ptm_quagga.$(OBJEXT)
 ptmd_OBJECTS = $(am_ptmd_OBJECTS)
 ptmd_DEPENDENCIES = ../lib/libptmdep.a
 am__vpath_adj_setup = srcdirstrip=`echo "$(srcdir)" | sed 's|.|.|g'`;
@@ -218,15 +219,15 @@ target_alias = @target_alias@
 top_build_prefix = @top_build_prefix@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
-PTMD_VERSION = "1.0"
-AM_CPPFLAGS = -I../lib
+PTMD_VERSION = "2.0"
+AM_CPPFLAGS = -I../lib -Igraph -Ihash
 AM_CFLAGS = -Wno-enum-compare -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$PTMD_VERSION\"
 AM_LDFLAGS = -L../lib -llldpctl -lcgraph -lrt -lcdt
 sbin_SCRIPTS = ptmctl
 ptmd_LDADD = ../lib/libptmdep.a
-ptmd_SOURCES = ptm_lldp.c ptm_ctl.c ptm_event.c ptm_conf.c ptm_msg.c ptm_timer.c
+ptmd_SOURCES = ptm_lldp.c ptm_ctl.c ptm_event.c ptm_conf.c ptm_msg.c ptm_timer.c ptm_bfd.c ptm_nbr.c ptm_quagga.c
 noinst_HEADERS = \
-	ptm_conf.h ptm_lldp.h ptm_event.h ptm_ctl.h ptm_timer.h ptm_msg.h
+	ptm_conf.h ptm_lldp.h ptm_event.h ptm_ctl.h ptm_timer.h ptm_msg.h ptm_bfd.h ptm_nbr.h ptm_quagga.h
 
 EXTRA_DIST = ptmctl.py
 all: all-am
@@ -348,11 +349,14 @@ mostlyclean-compile:
 distclean-compile:
 	-rm -f *.tab.c
 
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_bfd.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_conf.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_ctl.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_event.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_lldp.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_msg.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_nbr.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_quagga.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ptm_timer.Po@am__quote@
 
 .c.o:

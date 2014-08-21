@@ -1,10 +1,5 @@
-/*********************************************************************
- * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
- *
- * ptm_event.[ch] provide the glue between the lower-level protocols
- * that provide physical topology information (such as LLDP) and the
- * upstream PTM verification functionality.
- */
+/* Copyright 2013 Cumulus Networks, Inc.  All rights reserved. */
+
 #ifndef _PTM_EVENT_H_
 #define _PTM_EVENT_H_
 
@@ -22,6 +17,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include "csv.h"
 
 #define MAXNAMELEN 255
 
@@ -31,34 +27,9 @@ typedef struct _ptm_client_t_ ptm_client_t;
 typedef struct _ptm_event_t_ ptm_event_t;
 typedef enum _ptm_sockevent_e_ ptm_sockevent_e;
 
-/**
- * Upstream callback function that should get called for each neighbor/
- * topology event.
- *
- * For PTM topology verification, this will be the function that
- * matches the "actual/operational" topology information (as provided in
- * ptm_event_t) with the "admin-provided/prescribed" topology information.
- * It would then take some actions based on that match - log and/or notify.
- *
- * \param event: pointer to the notification event structure. Note: the
- *               memory for the event comes out of a global structure and
- *               will get overwritten once the callback returns. So copy
- *               it to new memory if you want to reuse.
- */
-typedef void (*ptm_event_cb) (ptm_event_t *event);
-
-typedef int (*ptm_init_module_cb) (ptm_globals_t *g);
-
-typedef int (*ptm_populate_module_cb) ();
-
-typedef int (*ptm_process_cb) (int in_fd, ptm_sockevent_e t, void *data);
-
-typedef int (*ptm_term_module_cb) (int fd);
-
 enum _ptm_exitcodes_e_ {
     PTM_EXITCODE_NO_LLDPD = -11,
     PTM_EXITCODE_NO_MEMORY = -12,
-    PTM_EXITCODE_IRFAILURE = -13,
 };
 
 /**
@@ -75,6 +46,8 @@ typedef enum {
  * List of all the modules that are part of PTM.
  * LLDP_MODULE: to get link level details.
  * NBR_MODULE: to get endpoint IP addresses.
+ * BFD_MODULE: to generate BFD transactions to all NBR's
+ * QUAGGA_MODULE: to generate BFD transactions to all QUAGGA neighbors 
  * CTL_MODULE: client connections to PTMD that want to receive
  *             topology status notifications.
  */
@@ -82,20 +55,53 @@ typedef enum {
     TIMER_MODULE,
     LLDP_MODULE,
     NBR_MODULE,
+    QUAGGA_MODULE,
+    BFD_MODULE,
     CTL_MODULE,
     CONF_MODULE,
     MAX_MODULE,
 } ptm_module_e;
-
-#define PTM_MODULE_EVENT_LLDP  0x1
-#define PTM_MODULE_EVENT_NBR   0x2
-#define PTM_MODULE_EVENT_CTL   0x4
 
 enum _ptm_sockevent_e_ {
     SOCKEVENT_READ,
     SOCKEVENT_WRITE,
     MAX_SOCKEVENT,
 };
+
+typedef enum {
+    MOD_STATE_INITIALIZED,
+    MOD_STATE_PARSE,
+    MOD_STATE_POPULATE,
+    MOD_STATE_ERROR,
+    MOD_STATE_RUNNING,
+} ptm_module_st_e;
+
+/* forward reference */
+struct ptm_conf_port;
+
+/**
+ * Upstream callback function that should get called for each neighbor/
+ * topology event.
+ *
+ * For PTM topology verification, this will be the function that
+ * matches the "actual/operational" topology information (as provided in
+ * ptm_event_t) with the "admin-provided/prescribed" topology information.
+ * It would then take some actions based on that match - log and/or notify.
+ *
+ * \param event: pointer to the notification event structure. Note: the
+ *               memory for the event comes out of a global structure and
+ *               will get overwritten once the callback returns. So copy
+ *               it to new memory if you want to reuse.
+ */
+typedef int (*ptm_event_cb) (ptm_event_t *event);
+typedef int (*ptm_parse_cb) (struct ptm_conf_port *port, char *args);
+typedef int (*ptm_init_cb) (ptm_globals_t *g);
+typedef int (*ptm_populate_cb) (ptm_globals_t *g);
+typedef int (*ptm_process_cb) (int in_fd, ptm_sockevent_e t, void *data);
+typedef int (*ptm_status_cb) (csv_t *, csv_record_t **, csv_record_t **,
+                              char *, void *);
+typedef int (*ptm_debug_cb) (csv_t *, csv_record_t **, csv_record_t **,
+                             char *, void *, char *);
 
 /**
  * The central structure used for topology notification to upper level
@@ -107,6 +113,7 @@ enum _ptm_sockevent_e_ {
  * @param module: which module sent the notification?
  * @param rname: remote system name
  * @param riface: remote interface name
+ * @param rdescr: remote interface description
  * @param liface: local interface name
  * @param rmac: remote interface's mac address
  * @param lmac: local interface's mac address
@@ -126,6 +133,7 @@ struct _ptm_event_t_ {
     char             *rname;
     char             *liface;
     char             *riface;
+    char             *rdescr;
     char             *lmac;
     char             *rmac;
     char             *lmgmtip;
@@ -136,18 +144,38 @@ struct _ptm_event_t_ {
 };
 
 /**
- * A structure to represent each module (see ptm_module_e enum). Each module
- * has an init routine, a process routine, and the parent fd it created. The
- * main routine in ptm_event.c takes these fds to set up the select() fdset
- * and blocks on the select() call. When select() returns, it figure out the
- * corresponding module and calls its process_cb routine.
+ * A structure to represent each module (see ptm_module_e enum).
+ * init_cb = handle module initialization
+ * parse_cb = handle module specific args specified in topo file
+ * populate_cb = populate with current data
+ * event_cb = handle events received from external entities (lldpctl, rtnetlink etc)
+ * process_cb = handle socket read buffer
+ * cmd_cb = handle cmds from external clients that connect to us
+ * peer_cb = call peer registered callback when event occurs
+ * fd  = socket listening on
  */
 struct _ptm_module_t_ {
-    ptm_init_module_cb     init_cb;
-    ptm_populate_module_cb fill_cb;
-    ptm_process_cb         process_cb;
-    int                    fd;
+    ptm_init_cb     init_cb;
+    ptm_parse_cb    parse_cb;
+    ptm_populate_cb populate_cb;
+    ptm_event_cb    event_cb;
+    ptm_process_cb  process_cb;
+    ptm_status_cb   status_cb;
+    ptm_debug_cb    debug_cb;
+    ptm_event_cb    peer_cb[MAX_MODULE];
+    int             fd;
+    ptm_module_st_e state;
 };
+
+typedef enum {
+    PTM_INIT,
+    PTM_RUNNING,
+    PTM_SHUTDOWN,
+    PTM_RECONFIG,
+} ptm_state_e;
+
+#define PTM_GET_STATE(g) g->ptm_state
+#define PTM_SET_STATE(g, s) g->ptm_state = s
 
 /**
  * A global structure visible to ptm_event.c as well as all the modules (LLDP,
@@ -155,18 +183,20 @@ struct _ptm_module_t_ {
  * data as parameters to functions.
  */
 struct _ptm_globals_t_ {
-    ptm_event_cb       event_cb[MAX_MODULE];
-    ptm_module_t       modules[MAX_MODULE];
-    fd_set             masterset;
-    fd_set             writeset;
-    fd_set             exceptset;
-    int                maxfd;
-    char               *my_hostname;
-    char               *my_mgmtip;
-    char               topo_file[MAXNAMELEN+1];
-    bool              hostname_changed;
-    bool              mgmt_ip_changed;
-    bool              conf_init_done;
+    ptm_module_t    modules[MAX_MODULE];
+    fd_set          masterset;
+    fd_set          writeset;
+    fd_set          exceptset;
+    int             maxfd;
+    unsigned int    retry_mods;
+    char            *my_hostname;
+    char            *my_mgmtip;
+    char            topo_file[MAXNAMELEN+1];
+    bool            hostname_changed;
+    bool            mgmt_ip_changed;
+    bool            conf_init_done;
+    void            *retry_timer;
+    ptm_state_e     ptm_state;
 };
 
 /**
@@ -191,10 +221,10 @@ ptm_event_type_str (ptm_event_e type)
     }
 }
 
-static inline const char *
+static inline char *
 ptm_module_string (ptm_module_e mod)
 {
-    const char *modstr[] = {"TIMER", "LLDP", "NBR", "CTL", "CONF"};
+    char *modstr[] = {"TIMER", "LLDP", "NBR", "QUAGGA", "BFD", "CTL", "CONF"};
     if (mod < MAX_MODULE) {
         return (modstr[mod]);
     }
@@ -206,23 +236,38 @@ ptm_module_string (ptm_module_e mod)
         if ((sfd) && module < MAX_MODULE) {      \
             (gbl)->modules[module].fd = (sfd);   \
         }                                        \
+        ptm_fd_add((sfd));                       \
     } while (0)
 
+#define PTM_MODULE_INITIALIZE(gbl, module)      \
+    do {                                        \
+        memset(&(gbl)->modules[module].parse_cb, 0x00,      \
+               (sizeof((gbl)->modules[module]) -            \
+                offsetof(struct _ptm_module_t_, parse_cb)));\
+        (gbl)->modules[module].fd = -1;                     \
+    } while (0)
 #define PTM_MODULE_FD(gbl, module)    (gbl)->modules[module].fd
+#define PTM_MODULE_INITCB(gbl, module) (gbl)->modules[module].init_cb
+#define PTM_MODULE_EVENTCB(gbl, module) (gbl)->modules[module].event_cb
+#define PTM_MODULE_POPULATECB(gbl, module) (gbl)->modules[module].populate_cb
+#define PTM_MODULE_PROCESSCB(gbl, module) (gbl)->modules[module].process_cb
+#define PTM_MODULE_PARSECB(gbl, module) (gbl)->modules[module].parse_cb
+#define PTM_MODULE_STATUSCB(gbl, module) (gbl)->modules[module].status_cb
+#define PTM_MODULE_DEBUGCB(gbl, module) (gbl)->modules[module].debug_cb
+#define PTM_MODULE_PEERCB(gbl, module, peer) (gbl)->modules[peer].peer_cb[module]
 
-#define PTM_MODULE_EVENTCB(gbl, module) (gbl)->event_cb[module]
-
-#define PTM_MODULE_POPULATECB(gbl, module) (gbl)->modules[module].fill_cb
+#define PTM_MODULE_SET_STATE(gbl, module, st) (gbl)->modules[module].state = st
+#define PTM_MODULE_GET_STATE(gbl, module) (gbl)->modules[module].state
 
 /**
  * String'ify PTM event structure.
  */
 char *ptm_event_str(ptm_event_t *event);
-
 void ptm_event_cleanup(ptm_event_t *event);
-
 void ptm_fd_cleanup(int fd);
-
 void ptm_fd_add (int fd);
+ptm_event_t * ptm_event_clone(ptm_event_t *event);
+void ptm_module_handle_event_cb(ptm_event_t *event);
+void ptm_module_request_reinit();
 
 #endif

@@ -1,5 +1,4 @@
-/* Copyright 2013 Cumulus Networks Inc.  All rights reserved. */
-/* See License file for licenese. */
+/* Copyright 2013 Cumulus Networks, LLC.  All rights reserved. */
 
 #ifndef __CSV_H__
 #define __CSV_H__
@@ -114,5 +113,36 @@ csv_record_t *csv_record_iter(csv_t *csv);
 csv_record_t *csv_record_iter_next(csv_record_t *rec);
 char *csv_field_iter(csv_record_t *rec, csv_field_t **fld);
 char *csv_field_iter_next(csv_field_t **fld);
+
+/**
+ * Checks to see if a record belongs to a csv
+ */
+int csv_is_record_valid(csv_t *csv, csv_record_t *in_rec);
+
+/**
+ * concat two records in a csv
+ * Returns the newly formed record which includes fields from rec1 and rec2
+ * rec1 and rec2 are removed
+ */
+csv_record_t *csv_concat_record(csv_t *csv, csv_record_t *rec1,
+                               csv_record_t *rec2);
+
+/**
+ * Remove a record from csv
+ * Only works when csv has discrete record bufs
+ */
+void csv_remove_record(csv_t *csv, csv_record_t *rec);
+
+/**
+ * Insert a record into csv
+ * Only works when csv has discrete record bufs
+ */
+void csv_insert_record(csv_t *csv, csv_record_t *rec);
+
+/**
+ * Serialize contents of csv into string
+ * Only works when csv has discrete record bufs
+ */
+void csv_serialize(csv_t *csv, char *msgbuf);
 
 #endif

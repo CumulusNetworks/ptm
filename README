@@ -1,2 +1,5 @@
 See the documents under docs for description of project.
 See the INSTALL file to determine how to configure/install the package.
+
+LLDPD needs to be updated to a version that is greater than 7.10
+https://github.com/vincentbernat/lldpd
