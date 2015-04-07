@@ -20,6 +20,7 @@
 #include "ptm_lldp.h"
 #include "ptm_ctl.h"
 #include "lldpctl.h"
+#include "lldp-const.h"
 #include "log.h"
 
 static int lldp_parse_match_type(lldp_parms_t *parms, char *val);
@@ -116,6 +117,7 @@ _extract_event (ptm_event_t *event,
 {
     lldpctl_atom_t *mgmts, *mgmt;
     const char *lldp_str;
+    const char *buf;
 
     if (!event || !interface || !neighbor || (type >= EVENT_UNKNOWN)) {
         ERRLOG("%s: Unknown event/if/nbr/type\n", __FUNCTION__);
@@ -137,12 +139,17 @@ _extract_event (ptm_event_t *event,
                                              lldpctl_k_interface_name));
     event->riface = strdup(lldpctl_atom_get_str(neighbor,
                                              lldpctl_k_port_id));
-    event->rdescr = strdup(lldpctl_atom_get_str(neighbor,
-                                             lldpctl_k_port_descr));
+    /* port description is not mandatory */
+    buf = lldpctl_atom_get_str(neighbor, lldpctl_k_port_descr);
+    if (buf)
+        event->rdescr = strdup(buf);
     event->rname = strdup(lldpctl_atom_get_str(neighbor,
                                              lldpctl_k_chassis_name));
-    event->rmac = strdup(lldpctl_atom_get_str(neighbor,
+    if (lldpctl_atom_get_int(neighbor, lldpctl_k_port_id_subtype) ==
+        LLDP_PORTID_SUBTYPE_LLADDR) {
+        event->rmac = strdup(lldpctl_atom_get_str(neighbor,
                                              lldpctl_k_port_id));
+    }
     mgmts = mgmt = NULL;
     mgmts = lldpctl_atom_get(neighbor, lldpctl_k_chassis_mgmt);
     lldpctl_atom_foreach(mgmts, mgmt) {
@@ -407,7 +414,8 @@ ptm_lldp_recv_cb (lldpctl_conn_t *conn,
 }
 
 #define UPDATE_FIELD(d, s) \
-            if (event->s) strncpy(l_port->d, event->s, sizeof(l_port->d))
+            if (event->s) strncpy(l_port->d, event->s, sizeof(l_port->d));\
+            else strncpy(l_port->d, "N/A", sizeof(l_port->d))
 
 static void
 handle_lldp_event_add_update(ptm_event_t *event)
