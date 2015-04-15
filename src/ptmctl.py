@@ -37,6 +37,8 @@ def ptm_get_link_status():
         if line is '':
             continue
         fields = line.split(":")
+        if len(fields) < 3:
+            continue
         iface = fields[1][1:]           # strip the leading space
         if 'UP,LOWER_UP' in fields[2]:
             link_status[iface] = 'up'
