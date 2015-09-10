@@ -237,12 +237,23 @@ csv_serialize(csv_t *csv, char *msgbuf)
 void
 csv_remove_record (csv_t *csv, csv_record_t *rec)
 {
+  csv_field_t *fld, *p_fld;
+
   /* first check if rec belongs to this csv */
   if(!csv_is_record_valid(csv, rec)){
     log_error("rec not in this csv\n");
     return;
   }
 
+  /* remove fields */
+  csv_field_iter(rec, &fld);
+  while(fld) {
+    p_fld = fld; 
+    csv_field_iter_next(&fld);
+    TAILQ_REMOVE(&(rec->fields), p_fld, next_field);
+    free(p_fld);
+  }
+  
   TAILQ_REMOVE(&(csv->records), rec, next_record);
   csv->num_recs--;
   csv->csv_len -= rec->rec_len;
