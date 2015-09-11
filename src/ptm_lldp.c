@@ -796,7 +796,7 @@ ptm_init_lldp (ptm_globals_t *g)
      * and connects to LLDPD if necessary.
      */
     if (ptm_lldp.gbl->my_hostname)
-        snprintf(old_mgmtip, HOST_NAME_MAX+1, "%s", ptm_lldp.gbl->my_hostname);
+        snprintf(old_hostname, HOST_NAME_MAX+1, "%s", ptm_lldp.gbl->my_hostname);
 
     if (ptm_lldp.gbl->my_mgmtip)
         snprintf(old_mgmtip, INET6_ADDRSTRLEN+1, "%s", ptm_lldp.gbl->my_mgmtip);
