@@ -1,4 +1,4 @@
-#AM_CFLAGS = -Wno-enum-compare -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$PTMD_VERSION\"
+#AM_CFLAGS = -Wno-enum-compare -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$(PTMD_VERSION)\"
 noinst_LIBRARIES = libptmdep.a
 libptmdep_a_SOURCES = csv.c  hash.c  hashtable.c  log.c  itimer.c
 noinst_HEADERS = \

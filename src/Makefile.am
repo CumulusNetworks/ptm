@@ -1,6 +1,6 @@
-PTMD_VERSION="2.0"
+PTMD_VERSION=2.0
 AM_CPPFLAGS = -I../lib -Igraph -Ihash
-AM_CFLAGS = -Wno-enum-compare -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$PTMD_VERSION\"
+AM_CFLAGS = -Wno-enum-compare -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$(PTMD_VERSION)\"
 AM_LDFLAGS = -L../lib -llldpctl -lcgraph -lrt -lcdt
 
 sbin_PROGRAMS = ptmd

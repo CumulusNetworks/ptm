@@ -42,7 +42,7 @@ AC_CHECK_LIB(cgraph,agopen)
 AC_CHECK_LIB(cgraph,agfstin)
 AC_CHECK_LIB(cgraph,agfstout)
 AC_CHECK_LIB(lldpctl, lldpctl_atom_dec_ref)
-AC_CHECK_LIB(lldpctl, lldpctl_process_conn_buffer, 0, AC_MSG_ERROR([Need LLDPD > 0.7.10]))
+AC_CHECK_LIB(lldpctl, lldpctl_process_conn_buffer, [], AC_MSG_ERROR([Need LLDPD > 0.7.10]))
 
 AC_OUTPUT(Makefile src/Makefile lib/Makefile)
 
