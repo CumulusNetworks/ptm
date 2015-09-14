@@ -6613,7 +6613,12 @@ fi
 { $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_lldpctl_lldpctl_process_conn_buffer" >&5
 $as_echo "$ac_cv_lib_lldpctl_lldpctl_process_conn_buffer" >&6; }
 if test "x$ac_cv_lib_lldpctl_lldpctl_process_conn_buffer" = xyes; then :
-  0
+  cat >>confdefs.h <<_ACEOF
+#define HAVE_LIBLLDPCTL 1
+_ACEOF
+
+  LIBS="-llldpctl $LIBS"
+
 else
   as_fn_error $? "Need LLDPD > 0.7.10" "$LINENO" 5
 fi
