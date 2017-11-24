@@ -221,7 +221,7 @@ top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
 PTMD_VERSION = "2.0"
 AM_CPPFLAGS = -I../lib -Igraph -Ihash
-AM_CFLAGS = -Wno-enum-compare -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$PTMD_VERSION\"
+AM_CFLAGS = -Wno-error=unused-result -Wno-enum-compare -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$PTMD_VERSION\"
 AM_LDFLAGS = -L../lib -llldpctl -lcgraph -lrt -lcdt
 sbin_SCRIPTS = ptmctl
 ptmd_LDADD = ../lib/libptmdep.a
