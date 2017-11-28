@@ -1,0 +1,10 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: libptm
+Description: Library to interface with ptmd
+Version: @PACKAGE_VERSION@
+Libs: -L${libdir} -lptm
+Cflags: -I${includedir}

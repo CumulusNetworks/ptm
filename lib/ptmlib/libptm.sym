@@ -1,0 +1,14 @@
+LIBPTM_1.0 {
+ global:
+  ptm_lib_process_msg;
+  ptm_lib_register;
+  ptm_lib_deregister;
+  ptm_lib_find_key_in_msg;
+  ptm_lib_init_msg;
+  ptm_lib_append_msg;
+  ptm_lib_complete_msg;
+
+ local: 
+  *;
+};
+
