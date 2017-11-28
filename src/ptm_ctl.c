@@ -1,5 +1,11 @@
 /*********************************************************************
- * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ * Copyright 2013 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2014,2015,2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
  *
  * ptm_ctl.[ch]: create a unix socket and listen on it for requests.
  */
@@ -10,15 +16,16 @@
 #include <sys/un.h>
 #include "ptm_event.h"
 #include "log.h"
+#include "ptm_lib.h"
 #include "ptm_conf.h"
 #include "ptm_ctl.h"
 #include <sys/stat.h>
 
 /* listen() call's backlog */
 #define MAX_CONNECTIONS 10
+#define MAX_CLIENTS     16
 const char  PTMD_CTL_SOCKET[] = "\0/var/run/ptmd.socket";
 
-static int ptm_event_ctl (ptm_event_t *event);
 
 /**
  * Global structure (private to this file) for bookkeeping - init params,
@@ -28,6 +35,7 @@ typedef struct {
     ptm_globals_t  *gbl;
     ptm_event_t    event;
     ptm_client_t   *clients[FD_SETSIZE];
+    int            num_clients;
     TAILQ_HEAD(, _ptm_client_t_) client_list;
 } ptm_ctl_globals_t;
 
@@ -37,27 +45,23 @@ static void
 _cleanup_client (int fd)
 {
     ptm_client_t *client;
+    ptm_client_buf_t *client_buf;
 
     if (ptm_ctl.clients[fd]) {
         client = ptm_ctl.clients[fd];
         ptm_ctl.clients[fd] = NULL;
         TAILQ_REMOVE(&(ptm_ctl.client_list), client, next);
+        while((client_buf = TAILQ_FIRST(&(client->pend_buflist))) != NULL) {
+            TAILQ_REMOVE(&(client->pend_buflist), client_buf, next);
+            free(client_buf);
+        }
         free(client);
+        ptm_ctl.num_clients--;
+
+        INFOLOG("Free client connection fd[%d] tot[%d]\n", fd,
+                ptm_ctl.num_clients);
     }
     ptm_fd_cleanup(fd);
-}
-
-static int
-_extract_event (ptm_event_t *ev,
-                ptm_client_t *client)
-{
-    if (!ev || !client) {
-        return (-1);
-    }
-    ev->type = EVENT_UPD;
-    ev->module = CTL_MODULE;
-    ev->client = client;
-    return (0);
 }
 
 static int
@@ -69,7 +73,7 @@ _accept_client (ptm_sockevent_e se)
 
     /* Accept all incoming connections that are queued up on the socket */
     do {
-        newfd = accept(PTM_MODULE_FD(g, CTL_MODULE), NULL, NULL);
+        newfd = accept(PTM_MODULE_FD(g, CTL_MODULE, 0), NULL, NULL);
         if (newfd < 0) {
             if (errno != EWOULDBLOCK) {
                 ERRLOG("%s: accept() failed (%s)\n", __FUNCTION__,
@@ -79,7 +83,12 @@ _accept_client (ptm_sockevent_e se)
             break;
         }
 
-        DLOG("  New incoming connection - %d\n", newfd);
+        if (ptm_ctl.num_clients == MAX_CLIENTS) {
+            ERRLOG("%s: Max clients connected (%d) - ignore accept\n",
+                   __FUNCTION__, ptm_ctl.num_clients);
+            _cleanup_client(newfd);
+            return (-1);
+        }
 
         /* Set the fd to non-blocking mode. */
         fcntl(newfd, F_SETFL, O_NONBLOCK);
@@ -97,7 +106,15 @@ _accept_client (ptm_sockevent_e se)
         memset(client, 0, sizeof(ptm_client_t));
         client->fd = newfd;
         ptm_ctl.clients[newfd] = client;
+        TAILQ_INIT(&(client->pend_buflist));
+        client->pend_numbufs = 0;
+        client->curr_buflen = 0;
         TAILQ_INSERT_TAIL(&(ptm_ctl.client_list), client, next);
+        ptm_ctl.num_clients++;
+
+        INFOLOG("New client connection fd[%d] tot[%d]\n", newfd,
+                ptm_ctl.num_clients);
+
     } while (newfd != -1);
     return (0);
 }
@@ -117,38 +134,23 @@ _process_client (int in_fd,
 
     client = ptm_ctl.clients[in_fd];
 
-    printf("fd %d got %d\n", in_fd, se);
-
     if (se == SOCKEVENT_WRITE) {
-        printf("_process_client: SOCKEVENT_WRITE\n");
         rc = ptm_ctl_send(client, NULL, 0);
         return (rc);
     }
 
-    do {
-        rc = recv(in_fd, client->inbuf, CTL_MSG_SZ, 0);
-        if (rc < 0) {
-            if (errno != EWOULDBLOCK) {
-                ERRLOG("  recv() failed (%s)\n", strerror(errno));
-                close_conn = 1;
-            }
-            break;
-        }
-        if (rc == 0) {
-            printf("  Connection closed\n");
-            close_conn = 1;
-            break;
-        }
+    rc = ptm_lib_process_msg(ptm_ctl.gbl->ptmlib_hdl, in_fd,
+                             client->inbuf, sizeof(client->inbuf),
+                             client);
+    if (rc < 0)
+        close_conn = 1;
 
-        client->inbuf_len = rc;
-        printf("  %d bytes received\n", client->inbuf_len);
-        _extract_event(&ptm_ctl.event, client);
-        ptm_module_handle_event_cb(&ptm_ctl.event);
-    } while (1);
+    if (PTM_CLIENT_GET_FLAGS(client) & PTM_CLIENT_MARK_FOR_DELETION)
+        close_conn = 1;
 
-    if (close_conn) {
+    if (close_conn)
         _cleanup_client(in_fd);
-    }
+
     return (rc);
 }
 
@@ -162,11 +164,9 @@ ptm_process_ctl (int in_fd,
     /*
      * Is it coming on the listen socket?
      */
-    if (in_fd == PTM_MODULE_FD(g, CTL_MODULE)) {
-        printf("  Listening socket is readable\n");
+    if (in_fd == PTM_MODULE_FD(g, CTL_MODULE, 0)) {
         _accept_client(se);
     } else {
-        printf("  Descriptor %d is readable\n", in_fd);
         _process_client(in_fd, se);
     }
     return (0);
@@ -191,22 +191,20 @@ ptm_init_ctl (ptm_globals_t *g)
     /* init the callbacks */
     PTM_MODULE_INITIALIZE(g, CTL_MODULE);
     PTM_MODULE_PROCESSCB(g, CTL_MODULE) = ptm_process_ctl;
-    PTM_MODULE_EVENTCB(g, CTL_MODULE) = ptm_event_ctl;
+    g->ptmlib_hdl = ptm_lib_register("ptm",
+                        ptm_conf_process_client_cmd, NULL, NULL);
 
     flags = SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK;
     if ((fd = socket(AF_UNIX, flags, 0)) == -1) {
         return (-1);
     }
 
-    PTM_MODULE_SET_FD(g, fd, CTL_MODULE);
+    PTM_MODULE_SET_FD(g, fd, CTL_MODULE, 0);
 
     /* Using abstract namespace socket */
     memset(&su, 0, sizeof(su));
     su.sun_family = AF_UNIX;
     memcpy(su.sun_path, PTMD_CTL_SOCKET, sizeof(PTMD_CTL_SOCKET));
-
-    printf("opening file %s\n", su.sun_path);
-//    unlink(su.sun_path);
 
     if (bind(fd, (struct sockaddr *)&su,
              sizeof(su.sun_family)+sizeof(PTMD_CTL_SOCKET)-1) == -1) {
@@ -220,6 +218,9 @@ ptm_init_ctl (ptm_globals_t *g)
         ERRLOG("cannot listen to control socket %s\n", PTMD_CTL_SOCKET);
         return (-1);
     }
+
+    PTM_MODULE_SET_STATE(g, CTL_MODULE, MOD_STATE_INITIALIZED);
+
     return (0);
 }
 
@@ -229,56 +230,77 @@ ptm_ctl_send (ptm_client_t *client,
               int buflen)
 {
     ptm_globals_t *g = ptm_ctl.gbl;
+    ptm_client_buf_t *client_buf;
     int rc = 0;
     int len = 0;
 
-    if (!client) {
-        return (rc);
+    if (!client ||
+        (PTM_CLIENT_GET_FLAGS(client) & PTM_CLIENT_MARK_FOR_DELETION)) {
+        return (-1);
     }
 
     /**
      * If there is some data in the outbuf, the last send was unsuccessful
-     * (e.g. flow control), so don't allow a new one. Exception is when we
-     * get called through select() that socket is available for write. In
-     * that case, buf would be NULL and buflen = 0.
+     * (e.g. flow control), so just queue up new ones. We will re-transmit
+     * when we get called through select() that socket is available for
+     * write. In that case, buf would be NULL and buflen = 0.
      */
-    if (client->outbuf_len && buflen) {
-        errno = EWOULDBLOCK;
-        ERRLOG("  Older data to be sent (%s)\n", strerror(errno));
+    if (client->curr_buflen && buflen) {
+        /* we have pending buffers - queue up new requests */
+        client_buf = (ptm_client_buf_t *)malloc(sizeof(ptm_client_buf_t));
+        if (client_buf) {
+            strcpy(client_buf->outbuf, buf);
+            client_buf->outbuf_len = buflen;
+            TAILQ_INSERT_TAIL(&(client->pend_buflist), client_buf, next);
+            client->pend_numbufs++;
+            DLOG("%s: Queueing pending buffer send [#%d]\n",
+                 __func__, client->pend_numbufs);
+            return (0);
+        }
         return (-1);
     }
 
     if (buflen) {
-        fprintf(stderr, "%s\n%d bytes\n", buf, buflen);
         memcpy(client->outbuf, buf, buflen);
-        client->outbuf_len = buflen;
-        client->pendingbuf = client->outbuf;
+        client->curr_buflen = buflen;
+        client->curr_outbuf = client->outbuf;
     }
 
-    len = client->outbuf_len;
+    len = client->curr_buflen;
     while (len != 0) {
-        rc = send(client->fd, client->pendingbuf, len, MSG_NOSIGNAL);
+        rc = send(client->fd, client->curr_outbuf, len, MSG_NOSIGNAL);
         if (rc < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                ERRLOG("  send() flow control(%s)\n", strerror(errno));
+                DLOG("  send() flow control(%s)\n", strerror(errno));
                 FD_SET(client->fd, &g->writeset);
                 if (client->fd > g->maxfd) {
                     g->maxfd = client->fd;
                 }
             } else {
+                /* let the caller clean up the client structure */
                 ERRLOG("  send() failed(%s)\n", strerror(errno));
-                _cleanup_client(client->fd);
+                PTM_CLIENT_SET_FLAGS(client, PTM_CLIENT_MARK_FOR_DELETION);
                 return (rc);
             }
             break;
         }
         len -= rc;
-        client->pendingbuf += rc;
+        client->curr_outbuf += rc;
+        /* if we have finished sending one buffer - check pending */
+        if ((len == 0) && (!TAILQ_EMPTY(&(client->pend_buflist)))) {
+            client_buf = TAILQ_FIRST(&(client->pend_buflist));
+            memcpy(client->outbuf, client_buf->outbuf, client_buf->outbuf_len);
+            len = client->curr_buflen = client_buf->outbuf_len;
+            client->curr_outbuf = client->outbuf;
+            TAILQ_REMOVE(&(client->pend_buflist), client_buf, next);
+            free(client_buf);
+            client->pend_numbufs--;
+        }
     }
 
-    client->outbuf_len = len;
+    client->curr_buflen = len;
     if (len == 0) {
-        client->pendingbuf = NULL;
+        client->curr_outbuf = NULL;
         FD_CLR(client->fd, &g->writeset);
     }
     return (rc);
@@ -327,20 +349,8 @@ ptm_client_safe_iter_next (ptm_client_t **saved)
     return (clnt);
 }
 
-static int
-ptm_event_ctl (ptm_event_t *event)
+void
+ptm_client_delete (ptm_client_t *client)
 {
-    if (event == NULL) {
-        ERRLOG("%s: Null event received\n", __func__);
-        return FALSE;
-    }
-
-    if (event->type == EVENT_UPD) {
-        /* Process the client's query */
-        ptm_conf_process_client_query(event);
-    } else {
-        DLOG("%s: Ignoring non-UPD event (%d)\n", __func__, event->type);
-    }
-
-    return TRUE;
+    _cleanup_client(client->fd);
 }

@@ -1,3 +1,10 @@
+/* Copyright 2014,2015,2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
+ */
 #include <stdio.h>
 #include <string.h>
 #include <netinet/in.h>
@@ -69,12 +76,11 @@ ptm_process_quagga_client (int in_fd,
     char qmsg[REPLY_BUFFER];
     int recved = 0;
 
-    if ((PTM_GET_STATE(ptm_quagga.gbl) == PTM_SHUTDOWN) ||
-        (PTM_GET_STATE(ptm_quagga.gbl) == PTM_RECONFIG)) {
+    if (PTM_GET_STATE(ptm_quagga.gbl) != PTM_RUNNING) {
         return (-1);
     }
 
-    assert(in_fd == PTM_MODULE_FD(ptm_quagga.gbl, QUAGGA_MODULE));
+    assert(in_fd == PTM_MODULE_FD(ptm_quagga.gbl, QUAGGA_MODULE, 0));
 
 
 
@@ -82,16 +88,16 @@ ptm_process_quagga_client (int in_fd,
     while (!end) {
         int len = 0;
 
-        len = recv(PTM_MODULE_FD(ptm_quagga.gbl, QUAGGA_MODULE), &qmsg,
+        len = recv(PTM_MODULE_FD(ptm_quagga.gbl, QUAGGA_MODULE, 0), &qmsg,
                    (REPLY_BUFFER - len), MSG_DONTWAIT);
         if (len < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                LOG("%s: recvmsg error (%s), breaking\n", __FUNCTION__,
+                ERRLOG("%s: recvmsg error (%s), breaking\n", __FUNCTION__,
                         strerror(errno));
                 break;
             }
             else {
-                LOG("%s: recvmsg error (%s), continuing\n", __FUNCTION__,
+                ERRLOG("%s: recvmsg error (%s), continuing\n", __FUNCTION__,
                         strerror(errno));
                 continue;
             }
@@ -101,7 +107,7 @@ ptm_process_quagga_client (int in_fd,
             printf("%s: recvmsg EOF\n", __FUNCTION__);
             ptm_fd_cleanup(ptm_quagga.fd);
             PTM_MODULE_SET_FD(ptm_quagga.gbl,
-                    ptm_quagga.fd_server, QUAGGA_MODULE);
+                    ptm_quagga.fd_server, QUAGGA_MODULE, 0);
             close(ptm_quagga.fd);
             break;
         }
@@ -125,7 +131,7 @@ ptm_process_quagga (int in_fd,
 {
     int ret = 0;
 
-    assert(in_fd == PTM_MODULE_FD(ptm_quagga.gbl, QUAGGA_MODULE));
+    assert(in_fd == PTM_MODULE_FD(ptm_quagga.gbl, QUAGGA_MODULE, 0));
 
     if (in_fd == ptm_quagga.fd_server) {
 
@@ -152,7 +158,7 @@ ptm_process_quagga (int in_fd,
         }
 
         ptm_quagga.fd = out_fd;
-        PTM_MODULE_SET_FD(ptm_quagga.gbl, ptm_quagga.fd, QUAGGA_MODULE);
+        PTM_MODULE_SET_FD(ptm_quagga.gbl, ptm_quagga.fd, QUAGGA_MODULE, 0);
     } else if (in_fd == ptm_quagga.fd) {
         ret = ptm_process_quagga_client(in_fd, se, udata);
     } else {
@@ -175,15 +181,16 @@ ptm_init_quagga (ptm_globals_t *g)
     PTM_MODULE_PROCESSCB(g, QUAGGA_MODULE) = ptm_process_quagga;
 
     /*
-     * prepare unix domain socket for quagga comm 
+     * prepare unix domain socket for quagga comm
      */
     ptm_quagga_connect(&ptm_quagga.fd_server, DIR_SERVER);
-    PTM_MODULE_SET_FD(g, ptm_quagga.fd_server, QUAGGA_MODULE);
+    PTM_MODULE_SET_FD(g, ptm_quagga.fd_server, QUAGGA_MODULE, 0);
     DLOG("Created quagga socket\n");
 
     //_send_quagga_request(QUAGGA_INIT);
     //ptm_process_quagga(mod->fd, SOCKEVENT_READ, NULL);
 
+    PTM_MODULE_SET_STATE(g, QUAGGA_MODULE, MOD_STATE_INITIALIZED);
+
     return (0);
 }
-

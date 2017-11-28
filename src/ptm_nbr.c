@@ -1,5 +1,11 @@
 /*********************************************************************
- * Copyright 2014 Cumulus Networks, Inc.  All rights reserved.
+ * Copyright 2013,2014 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2015,2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
  *
  * ptm_nbr.[ch] contains code that interacts with rtnetlink (NETLINK_ROUTE)
  * messages, extract the required information about the neighbor table (eg. ARP entry)
@@ -35,414 +41,357 @@ struct nl_req_s {
  * input params, statistics, and such.
  */
 typedef struct {
-    pid_t          pid;
-    uint32_t       seq;
     ptm_globals_t  *gbl;
     ptm_event_t    event;
-    uint64_t       num_notifs;
 } ptm_nbr_globals_t;
 
 ptm_nbr_globals_t ptm_nbr;
 
 nbr_hash_t *nbr_addr_hash = NULL;
-nbr_hash_t *nbr_port_hash = NULL;
-
-#define MAC_STR_SZ 14
+nbr_hash_t *pri_nbr_addr_hash = NULL;
 
 static int ptm_populate_nbr ();
-static int ptm_process_nbr (int in_fd, ptm_sockevent_e se, void *udata);
-static int ptm_event_nbr(ptm_event_t *event);
+static int ptm_nbr_check_blacklist_interface(const char *iface);
+static int ptm_nbr_check_blacklist_ipaddr(const char *ipaddr);
+static void _update_nbr_hash(ptm_module_e, char *, char *, bool *, char *);
+static void _nbr_process_secondary_addr(void);
+
+/* check for blacklisted IPs
+ * For eg. 169.254.0.1, is installed as part of RFC5549 implementation
+ */
+static int
+ptm_nbr_check_blacklist_ipaddr(const char *ipaddr)
+{
+    int i;
+    char *blacklist[] = {"169.254.0.1"};
+
+    if (!ipaddr)
+        return 0;
+
+    for (i = 0; i < sizeof(blacklist)/sizeof(char *); i++) {
+        if (!strncmp(ipaddr, blacklist[i], strlen(blacklist[i]))) {
+            DLOG("blacklisted ipaddr %s\n", ipaddr);
+            return 1;
+        }
+    }
+    /* all checks clear */
+    return 0;
+}
 
 static int
-_extract_event (const struct sockaddr_nl *who,
-		struct nlmsghdr *n,
-		void *arg,
-		ptm_event_t *ev)
+ptm_nbr_check_blacklist_interface(const char *iface)
 {
-    struct ndmsg *r = NLMSG_DATA(n);
-    int len = n->nlmsg_len;
-    struct rtattr * tb[NDA_MAX+1];
-    struct rtattr *rta;
-    char abuf[256];
-    char lmbuf[MAC_STR_SZ];
-    int tlen;
+    int i;
+    char *blacklist[] = {"eth", "lo"};
 
-    if (n->nlmsg_type != RTM_NEWNEIGH && n->nlmsg_type != RTM_DELNEIGH) {
-        LOG("Not a NEIGH message: %08x %08x %08x\n",
-        n->nlmsg_len, n->nlmsg_type, n->nlmsg_flags);
-        return (0);
+    if (!iface)
+        return 0;
+
+    for (i = 0; i < sizeof(blacklist)/sizeof(char *); i++) {
+        if (!strncmp(iface, blacklist[i], strlen(blacklist[i]))) {
+            DLOG("blacklisted interface %s\n", iface);
+            return 1;
+        }
+    }
+    /* all checks clear */
+    return 0;
+}
+
+static void
+_update_nbr_event(ptm_module_e type, char *peer_addr,
+                  char *port_name, char *rmac_buf)
+{
+    ptm_event_cleanup(&ptm_nbr.event);
+    memset(&ptm_nbr.event, 0x00, sizeof(ptm_nbr.event));
+
+    ptm_nbr.event.module = NBR_MODULE;
+    ptm_nbr.event.type = type;
+    if (ptm_ipaddr_get_ip_type(peer_addr) == AF_INET)
+        ptm_nbr.event.rv4addr = strdup(peer_addr);
+    else
+        ptm_nbr.event.rv6addr = strdup(peer_addr);
+    ptm_nbr.event.liface = strdup(port_name);
+    ptm_nbr.event.rmac = strdup(rmac_buf);
+}
+
+static int
+_extract_event (ptm_event_t *ev)
+{
+    bool is_primary = FALSE;
+    char *peer_addr;
+
+    if(!ev->rv4addr && !ev->rv6addr) {
+        /* NULL peer/remote IP passed in - ignore event */
+        DLOG("NULL remote IP\n");
+        return -1;
     }
 
-    memset(ev, 0x00, sizeof(*ev));
-    ev->module = NBR_MODULE;
-
-    len -= NLMSG_LENGTH(sizeof(*r));
-    if (len < 0) {
-        LOG("BUG: wrong nlmsg len %d\n", len);
+    if (!ev->liface || (!ptm_conf_get_port_by_name(ev->liface))) {
         return (-1);
     }
 
-    tlen = n->nlmsg_len - NLMSG_LENGTH(sizeof(*r));
-    rta = ((struct rtattr*)(((char*)(r)) + NLMSG_ALIGN(sizeof(struct ndmsg))));
-    memset(tb, 0, sizeof(struct rtattr *) * (NDA_MAX + 1));
-    while (RTA_OK(rta, tlen)) {
-        if ((rta->rta_type <= NDA_MAX) && (!tb[rta->rta_type]))
-	    tb[rta->rta_type] = rta;
-	rta = RTA_NEXT(rta, tlen);
-    }
-    if (tlen) {
-        ERRLOG("!!!Deficit %d, rta_len=%d\n", tlen, rta->rta_len);
-	return (-1);
+    /* check for blacklisted interfaces (ethx, lo) */
+    if (ptm_nbr_check_blacklist_interface(ev->liface))
+        return (-1);
+
+    peer_addr = ev->rv4addr?ev->rv4addr:ev->rv6addr;
+
+    /* check for blacklisted IP (eg. 169.254.0.1) */
+    if (ptm_nbr_check_blacklist_ipaddr(peer_addr))
+        return (-1);
+
+    if (ev->rv6addr && !ptm_ipaddr_is_ipv6_link_local(ev->rv6addr)) {
+        DLOG("NBR Recd %s for [%s - %s] - not link-local - ignore\n",
+             ptm_event_type_str(ev->type), ev->liface, ev->rv6addr);
+        return -1;
     }
 
-    if (tb[NDA_DST]) {
-        inet_ntop(r->ndm_family, RTA_DATA(tb[NDA_DST]),
-		  abuf,	sizeof(abuf));
-	    switch(r->ndm_family) {
-	    case AF_INET6:
-	        ev->rv6addr = strdup(abuf);
-	        break;
-	    case AF_INET:
-	        ev->rv4addr = strdup(abuf);
-	        break;
-	    default:
-	        ERRLOG("bad address family\n");
-	        break;
-	    }
+    _update_nbr_hash(ev->type, peer_addr, ev->liface, &is_primary, ev->rmac);
+
+    if (!is_primary) {
+        DLOG("NBR Recd %s for [%s - %s] - not primary - ignore\n",
+             ptm_event_type_str(ev->type), ev->liface, peer_addr);
+        return -1;
     }
 
-    if (tb[NDA_LLADDR]) {
-        memcpy(lmbuf, RTA_DATA(tb[NDA_LLADDR]), ETH_ALEN);
-        ev->lmac = strdup(lmbuf);
-    }
-
-    if (r->ndm_state) {
-        int nud = r->ndm_state;
-        if ((nud & NUD_REACHABLE) ||
-            (nud & NUD_DELAY) ||
-            (nud & NUD_STALE) ||
-            (nud & NUD_PERMANENT) ||
-            (nud & NUD_PROBE)) {
-            ev->type = EVENT_ADD;
-        } else if ((nud & NUD_INCOMPLETE) ||
-                   (nud & NUD_FAILED) ||
-                   (nud & NUD_NOARP)) {
-            ev->type = EVENT_DEL;
-        } else {
-            ev->type = EVENT_UNKNOWN;
-        }
-    }
-
-    if_indextoname(r->ndm_ifindex, abuf);
-    ev->liface = NULL;
-    if (strlen(abuf))
-        ev->liface = strdup(abuf);
+    _update_nbr_event(ev->type, peer_addr, ev->liface, ev->rmac);
 
     return (0);
 }
 
-/* XXX needs to be in ptm_netlink.c */
-static int
-_send_netlink_request (uint16_t type)
+static void
+_update_nbr_hash(ptm_module_e type, char *peer_addr,
+                 char *port_name, bool *ret_primary, char *rmac_buf)
 {
-    struct sockaddr_nl kernel;
-    struct msghdr rtnl_msg;
-    struct iovec io;
-    nl_req_t req;
+    nbr_key_t key;
+    pri_nbr_key_t pri_key;
+    nbr_hash_t *n_addr, *p_addr;
+    bool is_primary = TRUE;
+    int afi = ptm_ipaddr_get_ip_type(peer_addr);
 
-    /* RTNL socket is ready for use, prepare and send request */
-    memset(&rtnl_msg, 0, sizeof(rtnl_msg));
-    memset(&kernel, 0, sizeof(kernel));
-    memset(&req, 0, sizeof(req));
+    /* find if a primary nbr has been recorded already */
+    memset(&pri_key, 0x00, sizeof(pri_key));
+    pri_key.afi = afi;
+    strcpy(pri_key.port_name, port_name);
+    HASH_FIND(afph, pri_nbr_addr_hash, &pri_key, sizeof(pri_key), p_addr);
 
-    kernel.nl_family = AF_NETLINK;
+    memset(&key, 0x00, sizeof(key));
+    strcpy(key.addr, peer_addr);
+    strcpy(key.port_name, port_name);
+    HASH_FIND(aph, nbr_addr_hash, &key, sizeof(key), n_addr);
 
-    req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtgenmsg));
-    req.hdr.nlmsg_type = type;
-    req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-    req.hdr.nlmsg_seq = ptm_nbr.seq;
-    ptm_nbr.seq++;
-    req.hdr.nlmsg_pid = ptm_nbr.pid;
+    if (p_addr &&
+        (!n_addr || memcmp(&n_addr->key, &p_addr->key, sizeof(p_addr->key))))
+        is_primary = FALSE;
 
-    io.iov_base = &req;
-    io.iov_len = req.hdr.nlmsg_len;
-    rtnl_msg.msg_iov = &io;
-    rtnl_msg.msg_iovlen = 1;
-    rtnl_msg.msg_name = &kernel;
-    rtnl_msg.msg_namelen = sizeof(kernel);
+    if (type == EVENT_ADD) {
 
-    sendmsg(PTM_MODULE_FD(ptm_nbr.gbl, NBR_MODULE),
-	    (struct msghdr *) &rtnl_msg, 0);
-    return (0);
-}
-
-#define UPDATE_FIELD(d, s) \
-            if (event->s) strncpy(n_addr->d, event->s, sizeof(n_addr->d))
-#define EXTRACT_FIELD(d, s) \
-            if (n_addr->s) event->d = strdup(n_addr->s)
-
-/**
- * Process events for NBR
- */
-static int
-ptm_event_nbr(ptm_event_t *event)
-{
-    ptm_conf_port_t *port = ptm_conf_get_port(event);
-    nbr_hash_t *n_addr;
-    nbr_hash_t *n_port;
-    int existing = FALSE;
-
-    if (!port || !event->rv4addr)
-        return -1;
-
-    HASH_FIND(ah, nbr_port_hash, event->liface,
-              strlen(event->liface), n_port);
-
-    HASH_FIND(ah, nbr_addr_hash, event->rv4addr,
-              strlen(event->rv4addr), n_addr);
-
-    if (n_port != n_addr) {
-        /* some mismatch - ignore this event */
-        return -1;
-    } else if (n_port) {
-        existing = TRUE;
-    }
-
-    if ((event->type == EVENT_ADD) ||
-        (event->type == EVENT_UPD)) {
-
-        DLOG("NBR Received %s event for addr:port %s:%s\n",
-             (event->type == EVENT_ADD)?"ADD":"UPD",
-             event->rv4addr, port->port_name);
+        DLOG("NBR Received ADD event for addr:port %s - %s [%s]\n",
+             peer_addr, port_name,
+             is_primary?"primary":"non-primary");
 
         /* allocate a new nbr */
         if (!n_addr) {
             if ((n_addr = calloc(1, sizeof(*n_addr))) == NULL) {
-                ERRLOG("Can't malloc memory for new NBR addr:port %s:%s\n",
-                       event->rv4addr, port->port_name);
-                return -1;
+                ERRLOG("malloc error for new NBR addr:port %s - %s [%s] %m\n",
+                       peer_addr, port_name,
+                       is_primary?"primary":"non-primary");
+                return;
+            }
+            memcpy(&n_addr->key, &key, sizeof(key));
+            n_addr->afi = afi;
+            HASH_ADD(aph, nbr_addr_hash, key, sizeof(key), n_addr);
+
+            if (is_primary) {
+                /* also add this entry into primary addr hash */
+                memcpy(&n_addr->pri_key, &pri_key, sizeof(pri_key));
+                HASH_ADD(afph, pri_nbr_addr_hash, pri_key,
+                         sizeof(pri_key), n_addr);
             }
         }
 
-        UPDATE_FIELD(port_name, liface);
-        UPDATE_FIELD(ipv4_addr, rv4addr);
-        UPDATE_FIELD(ipv6_addr, rv6addr);
-        n_addr->event = ptm_event_clone(event);
+        n_addr->is_primary = is_primary;
+        strcpy(n_addr->mac, rmac_buf);
 
-        if (!existing) {
-            HASH_ADD(ah, nbr_addr_hash, ipv4_addr,
-                 strlen(n_addr->ipv4_addr), n_addr);
-            HASH_ADD(ph, nbr_port_hash, port_name,
-                 strlen(n_addr->port_name), n_addr);
+    } else if (type == EVENT_DEL) {
+        DLOG("NBR Received DEL event for addr:port %s - %s [%s]\n",
+             peer_addr, port_name,
+             is_primary?"primary":"non-primary");
+
+        if (!n_addr) {
+            DLOG("NBR not found addr:port %s - %s \n",
+                 peer_addr, port_name);
+            return;
         }
 
-    } else if (event->type == EVENT_DEL) {
-        DLOG("NBR Received DEL event for addr:port %s:%s\n",
-              event->rv4addr, port->port_name);
+        if (is_primary)
+            HASH_DELETE(afph, pri_nbr_addr_hash, n_addr);
 
-        if (n_addr) {
-            HASH_DELETE(ah, nbr_addr_hash, n_addr);
-            HASH_DELETE(ph, nbr_port_hash, n_addr);
-            ptm_event_cleanup(n_addr->event);
-            free(n_addr->event);
-            free(n_addr);
-        }
-
-    } else {
-        DLOG("NBR Received UNK event for addr:port %s:%s\n",
-              event->rv4addr, port->port_name);
-        return -1;
+        HASH_DELETE(aph, nbr_addr_hash, n_addr);
+        free(n_addr);
     }
 
-    return(0);
+    *ret_primary = is_primary;
 }
 
 static int
-ptm_populate_nbr ()
+ptm_handle_nl_nbr_event(ptm_event_t *event)
 {
-    nbr_hash_t *n_addr, *tmp;
-    int old;
+    if (_extract_event(event) != -1) {
+        ptm_module_handle_event_cb(&ptm_nbr.event);
 
-    INFOLOG("%s: Post Init operations \n", __FUNCTION__);
-
-    old = HASH_CNT(ah, nbr_addr_hash);
-
-    if (old) {
-        /* clear out old entries */
-        HASH_ITER(ah, nbr_addr_hash, n_addr, tmp) {
-            /* stale entry */
-            HASH_DELETE(ah, nbr_addr_hash, n_addr);
-            HASH_DELETE(ph, nbr_port_hash, n_addr);
-            ptm_event_cleanup(n_addr->event);
-            free(n_addr);
+        if (ptm_nbr.event.type == EVENT_DEL) {
+            /* process secondary (if present) */
+            _nbr_process_secondary_addr();
         }
+    }
+    ptm_event_cleanup(&ptm_nbr.event);
 
-        DLOG("%s: Cleaned up %d stale entries\n", __FUNCTION__, old);
+    return 0;
+}
 
-        /* request new dump */
-        _send_netlink_request(RTM_GETNEIGH);
+static int
+ptm_peer_event_nbr(ptm_event_t *event)
+{
+    char *src_addr = (event->lv4addr) ? event->lv4addr :
+                        (event->lv6addr)?event->lv6addr:"N/A";
+    char *peer_addr = (event->rv4addr) ? event->rv4addr :
+                        (event->rv6addr)?event->rv6addr:"N/A";
+
+    DLOG("Recv [%s] event [%s] vrf [%s] Ifname [%s] Src [%s] Dst [%s]\n",
+         ptm_module_string(event->module),
+         ptm_event_type_str (event->type),
+         (event->vrf_name)?event->vrf_name:"N/A",
+         (event->liface)?event->liface:"N/A",
+         src_addr, peer_addr);
+
+    switch(event->module) {
+        case NETLINK_MODULE:
+            ptm_handle_nl_nbr_event(event);
+            break;
+        default:
+            INFOLOG("Recv [%s] event [%s] vrf [%s] peer [%s]: ignore\n",
+                    ptm_module_string(event->module),
+                    ptm_event_type_str (event->type),
+                    (event->vrf_name)?event->vrf_name:"N/A",
+                    peer_addr);
     }
 
     return 0;
 }
 
 static int
-ptm_process_nbr (int in_fd, ptm_sockevent_e se, void *udata)
+ptm_populate_nbr ()
 {
-    int end = 0;
-    char reply[REPLY_BUFFER];
-    struct iovec io;
-    struct sockaddr_nl kernel;
+    nbr_hash_t *n_addr, *tmp;
+    int pri_cnt = 0, nbr_cnt = 0;
 
-    if ((PTM_GET_STATE(ptm_nbr.gbl) == PTM_SHUTDOWN) ||
-        (PTM_GET_STATE(ptm_nbr.gbl) == PTM_RECONFIG)) {
-        return (-1);
+    INFOLOG("%s: Post Init operations \n", __FUNCTION__);
+
+    PTM_MODULE_PEERCB(ptm_nbr.gbl, NBR_MODULE, NETLINK_MODULE)
+                    = ptm_peer_event_nbr;
+
+    PTM_MODULE_SET_STATE(ptm_nbr.gbl, NBR_MODULE, MOD_STATE_POPULATE);
+
+    if (!ptm_nbr.gbl->my_hostname) {
+        DLOG("%s: Hostname Not Available - ignore\n", __FUNCTION__);
+        return 0;
     }
 
-    assert(in_fd == PTM_MODULE_FD(ptm_nbr.gbl, NBR_MODULE));
+    /* clear out primary entries */
+    HASH_ITER(afph, pri_nbr_addr_hash, n_addr, tmp) {
+        HASH_DELETE(afph, pri_nbr_addr_hash, n_addr);
+        pri_cnt++;
+    }
 
-    /* parse reply */
-    while (!end) {
-        int len;
-        struct nlmsghdr *msg_ptr;
-        struct msghdr rtnl_reply;
-        struct iovec io_reply;
+    /* clear out nbr entries */
+    HASH_ITER(aph, nbr_addr_hash, n_addr, tmp) {
+        /* stale entry */
+        HASH_DELETE(aph, nbr_addr_hash, n_addr);
+        free(n_addr);
+        nbr_cnt++;
+    }
 
-        memset(&io_reply, 0, sizeof(io_reply));
-        memset(&rtnl_reply, 0, sizeof(rtnl_reply));
+    DLOG("NBR: Cleaned up nbr (%d) primary (%d) entries\n",
+         nbr_cnt, pri_cnt);
 
-        io.iov_base = reply;
-        io.iov_len = REPLY_BUFFER;
-        rtnl_reply.msg_iov = &io;
-        rtnl_reply.msg_iovlen = 1;
-        rtnl_reply.msg_name = &kernel;
-        rtnl_reply.msg_namelen = sizeof(kernel);
+    return 0;
+}
 
-        len = recvmsg(PTM_MODULE_FD(ptm_nbr.gbl, NBR_MODULE), &rtnl_reply, 0);
-        if (len < 0) {
-            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-#if 0
-                LOG("%s: recvmsg error (%s), breaking\n", __FUNCTION__,
-                        strerror(errno));
-#endif
-                break;
-            }
-            else {
-                LOG("%s: recvmsg error (%s), continuing\n", __FUNCTION__,
-                        strerror(errno));
-                continue;
-            }
+/* routine helps in promoting a secondary peer addr to primary
+ * and calls the event handler for the new primary
+ *
+ * assumed to be called after primary has been deleted
+ */
+static void
+_nbr_process_secondary_addr(void)
+{
+    nbr_hash_t *n_addr, *tmp;
+    int afi;
+    ptm_event_t *ev = &ptm_nbr.event;
+
+    afi = AF_INET6;
+    if (ev->rv4addr)
+        afi = AF_INET;
+
+    HASH_ITER(aph, nbr_addr_hash, n_addr, tmp) {
+        if (strcmp(n_addr->key.port_name, ev->liface)) {
+            continue;
         }
-
-        if (len == 0) {
-            LOG("%s: recvmsg EOF\n", __FUNCTION__);
+        if (n_addr->afi == afi) {
+            /* same interface, same AFI, different peer
+             * promote to primary
+             */
+            n_addr->is_primary = TRUE;
+            n_addr->pri_key.afi = afi;
+            strcpy(n_addr->pri_key.port_name, ev->liface);
+            HASH_ADD(afph, pri_nbr_addr_hash, pri_key,
+                     sizeof(n_addr->pri_key), n_addr);
+            INFOLOG("NBR Promote [%s - %s] to primary\n",
+                    n_addr->key.addr, ev->liface);
             break;
         }
-
-        if (len) {
-            for (msg_ptr = (struct nlmsghdr *) reply;
-                    NLMSG_OK(msg_ptr, (unsigned int) len);
-                    msg_ptr = NLMSG_NEXT(msg_ptr, len)) {
-
-                switch(msg_ptr->nlmsg_type) {
-                    case NLMSG_DONE:
-                        end++;
-                        break;
-                    case RTM_NEWNEIGH:
-                    case RTM_GETNEIGH: /* XXX why would we get this ? */
-                    case RTM_DELNEIGH:
-                        _extract_event(NULL, msg_ptr, NULL, &ptm_nbr.event);
-                        /*
-                         * XXX ev.rv6addr, ev.rv4addr, ev.liface XX not
-                         * needed, as routing should handle this
-                         *
-                         * XXX A little messed up, we should store in binary
-                         * format and let modules expand into string
-                         * format
-                         */
-                        ptm_module_handle_event_cb(&ptm_nbr.event);
-                        ptm_event_cleanup(&ptm_nbr.event);
-                        break;
-                    default:
-                        ERRLOG("message type %d, length %d\n",
-                                msg_ptr->nlmsg_type,
-                                msg_ptr->nlmsg_len);
-                        break;
-                }
-            }
-        }
     }
 
-    return (0);
+    if (!n_addr) {
+        /* no secondary peer addr promoted to primary */
+        return;
+    }
+
+    /* found a new primary peer addr - send EVENT_ADD */
+    _update_nbr_event(EVENT_ADD, n_addr->key.addr,
+                      n_addr->key.port_name, n_addr->mac);
+
+    ptm_module_handle_event_cb(&ptm_nbr.event);
 }
 
 int
 ptm_init_nbr (ptm_globals_t *g)
 {
-    struct sockaddr_nl local;
-    int fd;
-    int flags = 0;
-
     ptm_nbr.gbl = g;
-    ptm_nbr.pid = getpid();
-    ptm_nbr.seq = 1;
 
     /* init the callbacks */
     PTM_MODULE_INITIALIZE(g, NBR_MODULE);
     PTM_MODULE_POPULATECB(g, NBR_MODULE) = ptm_populate_nbr;
-    PTM_MODULE_PROCESSCB(g, NBR_MODULE) = ptm_process_nbr;
-    PTM_MODULE_EVENTCB(g, NBR_MODULE) = ptm_event_nbr;
 
-    /*
-     * prepare netlink socket for kernel/userland communication
-     */
-    flags = SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK;
-    fd = socket(AF_NETLINK, flags, NETLINK_ROUTE);
-    if (fd < 0) {
-        ERRLOG("Can't open netlink socket(%s)\n", strerror(errno));
-	return (1);
-    }
-    PTM_MODULE_SET_FD(g, fd, NBR_MODULE);
-    memset(&local, 0, sizeof(local));
-    local.nl_family = AF_NETLINK;
-    local.nl_pid = ptm_nbr.pid;
-    local.nl_groups = RTMGRP_NEIGH;
-
-    if (bind(fd, (struct sockaddr *) &local, sizeof(local)) < 0) {
-        ERRLOG("cannot bind (%s), are you root ?", strerror(errno));
-        return (-1);
-    }
-
-    _send_netlink_request(RTM_GETNEIGH);
+    PTM_MODULE_SET_STATE(g, NBR_MODULE, MOD_STATE_INITIALIZED);
 
     return (0);
 }
 
-void
-ptm_nbr_get_event_by_port(char *port_name, ptm_event_t **event)
+bool
+ptm_nbr_is_addr_primary(char *peer_addr, char *port_name)
 {
     nbr_hash_t *n_addr;
+    nbr_key_t key;
 
-    *event = NULL;
-    HASH_FIND(ph, nbr_port_hash, port_name,
-              strlen(port_name), n_addr);
+    memset(&key, 0x00, sizeof(key));
+    strcpy(key.addr, peer_addr);
+    strcpy(key.port_name, port_name);
+    HASH_FIND(aph, nbr_addr_hash, &key, sizeof(key), n_addr);
 
-    if (n_addr) {
-        *event = ptm_event_clone(n_addr->event);
-    }
-}
+    if (n_addr && n_addr->is_primary)
+        return TRUE;
 
-ptm_conf_port_t *
-ptm_nbr_get_port_from_addr(char *addr)
-{
-    ptm_conf_port_t *port = NULL;
-    nbr_hash_t *n_addr;
-
-    HASH_FIND(ah, nbr_addr_hash, addr, strlen(addr), n_addr);
-
-    if (n_addr) {
-        port = ptm_conf_get_port_by_name(n_addr->port_name);
-    }
-
-    return port;
+    return FALSE;
 }

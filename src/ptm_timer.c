@@ -1,3 +1,11 @@
+/* Copyright 2013,2014,2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
+ */
+
 #include <sys/timerfd.h>
 #include <time.h>
 #include <stdint.h>
@@ -9,6 +17,7 @@
 //#define DEBUG_TIMER
 
 #define PTM_MIN_TIMER_EXPIRY_NSECS (50 * NSEC_PER_MSEC)
+#define PTM_TIMER_EXPIRY_SKID_NSECS (10 * NSEC_PER_MSEC)
 
 /* timer internal flags */
 #define T_SF_ARMED      (1 << 0)
@@ -58,7 +67,7 @@ cl_timer_globals_t ptm_tg;
  * cl_timer_arm
  * This routine arms the timer and programs the timer_fd appropriately
  * @interval - has to be specified (secs or nsecs)
- * @flags - T_UF_PERIOIDIC/T_UF_PERSIST_SSHOT/T_UF_NSEC
+ * @flags - T_UF_PERIODIC/T_UF_PERSIST_SSHOT/T_UF_NSEC
  */
 int
 cl_timer_arm (cl_timer_t *timer,
@@ -78,8 +87,8 @@ cl_timer_arm (cl_timer_t *timer,
     }
 
     if ((flags == 0) ||
-        ((flags & (T_UF_PERIOIDIC | T_UF_PERSIST_SSHOT)) ==
-                            (T_UF_PERIOIDIC | T_UF_PERSIST_SSHOT))) {
+        ((flags & (T_UF_PERIODIC | T_UF_PERSIST_SSHOT)) ==
+                            (T_UF_PERIODIC | T_UF_PERSIST_SSHOT))) {
         /* flags clear or both flags set */
         return (0);
     }
@@ -171,6 +180,7 @@ _timer_setfd(cl_timer_t *timer)
 {
     struct itimerspec curr;
     struct timespec exp, now;
+    struct timespec new_interval;
     int rc, set_fd = 0;;
 
     /*
@@ -199,37 +209,46 @@ _timer_setfd(cl_timer_t *timer)
         cl_add_time_ts(&exp, &ptm_tg.cached_interval);
         if (cl_comp_time(&now, &exp) > 0) {
             /* loop has taken too much time - cache interval has elapsed */
-            ptm_tg.cached_interval.tv_sec = 0;
-            ptm_tg.cached_interval.tv_nsec = PTM_MIN_TIMER_EXPIRY_NSECS;
+            new_interval.tv_sec = 0;
+            new_interval.tv_nsec = PTM_MIN_TIMER_EXPIRY_NSECS;
         } else {
             /* update cache interval minus loop time */
-            cl_diff_time_ts(&exp, &now, &ptm_tg.cached_interval);
+            cl_diff_time_ts(&exp, &now, &new_interval);
         }
         set_fd = 1;
     } else if ((curr.it_value.tv_sec == 0) &&
-        (curr.it_value.tv_nsec == 0)) {
-        /* special case where timer_fd has no value
-         * calculate new expiration time for our timer
+               (curr.it_value.tv_nsec == 0)) {
+        /* special case where timer_fd has gone to zero */
+
+        /* one scenario is that a previous timer obj has expired
+         * but we have not yet called the select loop
+         * if there is more than 1 element (including this one)
+         * in the timer array - thats our clue.
+         * set the timer to a min value
          */
+	    if (kv_size(ptm_tg.run_queue) > 1) {
+            new_interval.tv_sec = 0;
+            new_interval.tv_nsec = PTM_MIN_TIMER_EXPIRY_NSECS;
+        } else {
+            /* calculate new expiration time for our timer */
+            cl_diff_time_ts(&timer->exp, &now, &new_interval);
+        }
         set_fd = 1;
     } else {
         /* find the min(timer_fd , current timer) */
         cl_cp_time(&exp, &now);
         cl_add_time_ts(&exp, &curr.it_value);
         if (cl_comp_time(&exp, &timer->exp) > 0) {
+            cl_diff_time_ts(&timer->exp, &now, &new_interval);
             set_fd = 1;
         }
     }
 
     if (set_fd) {
 
-        if (timer) {
-            /* calculate new expiration delta */
-            cl_diff_time_ts(&timer->exp, &now, &curr.it_value);
-        } else {
-            /* use updated cached interval */
-            cl_cp_time(&curr.it_value, &ptm_tg.cached_interval);
-        }
+        cl_cp_time(&curr.it_value, &new_interval);
+
+        cl_add_time(&curr.it_value, PTM_TIMER_EXPIRY_SKID_NSECS);
 
         /* keep a copy for debug */
         cl_cp_time(&ptm_tg.next_timer, &curr.it_value);
@@ -316,14 +335,14 @@ ptm_event_timer(int fd,
          * and it's time for expiry.
          */
         if (cl_comp_time(&now, &qitem->exp) >= 0) {
-            if ((qitem->user_flags & T_UF_PERIOIDIC) == 0) {
+            if ((qitem->user_flags & T_UF_PERIODIC) == 0) {
                 qitem->state_flags &= ~T_SF_ARMED;
             }
             qitem->num_expiries++;
             qitem->cb(qitem, qitem->context);
             /* periodic timers are auto-re-armed */
             if (((qitem->state_flags & T_SF_DELETED) == 0) &&
-                (qitem->user_flags & T_UF_PERIOIDIC)) {
+                (qitem->user_flags & T_UF_PERIODIC)) {
                 _arm_timer(qitem);
                 _update_cached_interval(qitem);
             }
@@ -356,7 +375,8 @@ ptm_init_timer(ptm_globals_t *g)
     }
     ptm_tg.g = g;
     ptm_tg.timer_fd = fd;
-    PTM_MODULE_SET_FD(ptm_tg.g, fd, TIMER_MODULE);
+    PTM_MODULE_SET_FD(ptm_tg.g, fd, TIMER_MODULE, 0);
+
+    PTM_MODULE_SET_STATE(g, TIMER_MODULE, MOD_STATE_INITIALIZED);
     return (0);
 }
-

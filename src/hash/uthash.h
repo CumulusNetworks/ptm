@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2003-2014, Troy D. Hanson     http://troydhanson.github.com/uthash/
+Copyright (c) 2003-2013, Troy D. Hanson     http://troydhanson.github.com/uthash/
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -64,7 +64,7 @@ typedef unsigned char uint8_t;
 #include <inttypes.h>   /* uint32_t */
 #endif
 
-#define UTHASH_VERSION 1.9.9
+#define UTHASH_VERSION 1.9.8
 
 #ifndef uthash_fatal
 #define uthash_fatal(msg) exit(-1)        /* fatal error (out of memory,etc) */
@@ -252,7 +252,7 @@ do {                                                                            
 #define HASH_FIND_STR(head,findstr,out)                                          \
     HASH_FIND(hh,head,findstr,strlen(findstr),out)
 #define HASH_ADD_STR(head,strfield,add)                                          \
-    HASH_ADD(hh,head,strfield[0],strlen(add->strfield),add)
+    HASH_ADD(hh,head,strfield,strlen(add->strfield),add)
 #define HASH_REPLACE_STR(head,strfield,add,replaced)                             \
   HASH_REPLACE(hh,head,strfield,strlen(add->strfield),add,replaced)
 #define HASH_FIND_INT(head,findint,out)                                          \

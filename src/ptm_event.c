@@ -1,5 +1,11 @@
 /*********************************************************************
- * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ * Copyright 2013,2015 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
  *
  * ptm_event.[ch] provide the glue between the lower-level protocols
  * that provide physical topology information (such as LLDP) and the
@@ -20,12 +26,17 @@
 #include "ptm_lldp.h"
 #include "ptm_ctl.h"
 #include "ptm_timer.h"
-#include "ptm_msg.h"
+#include "ptm_netlink.h"
+#include "ptm_lib.h"
 
 static FILE *pid_fp;
 
-/* retry interval expressed in NS */
-#define INIT_RETRY_INTERVAL (100 * NSEC_PER_MSEC)
+/* fast retry interval expressed in NS */
+#define FAST_INIT_RETRY_INTERVAL (500 * NSEC_PER_MSEC)
+/* slow retry interval */
+#define SLOW_INIT_RETRY_INTERVAL 15
+/* reconfig interval */
+#define RECONFIG_RETRY_INTERVAL (NSEC_PER_MSEC)
 
 static void ptm_init_mod_fds();
 static void ptm_queue_init_retry_timer();
@@ -106,6 +117,10 @@ ptm_event_str (ptm_event_t *event)
                          event->client->inbuf_len);
     }
 
+    if (event->vrf_name) {
+        tlen += snprintf((str+tlen), (len - tlen), " vrf: %s",
+                     event->vrf_name);
+    }
     tlen += snprintf((str+tlen), (len - tlen), "\n");
     return (estr);
 }
@@ -135,6 +150,8 @@ ptm_event_clone(ptm_event_t *event)
         return NULL;
     }
 
+    ev_new->type = event->type;
+    ev_new->module = event->module;
     ALLOC_CP(lname);
     ALLOC_CP(rname);
     ALLOC_CP(liface);
@@ -146,6 +163,12 @@ ptm_event_clone(ptm_event_t *event)
     ALLOC_CP(rmgmtip);
     ALLOC_CP(rv6addr);
     ALLOC_CP(rv4addr);
+    ALLOC_CP(lv6addr);
+    ALLOC_CP(lv4addr);
+    ALLOC_CP(vrf_name);
+    ev_new->vnid = event->vnid;
+    ev_new->vnid_present = event->vnid_present;
+    ev_new->bfdtype = event->bfdtype;
 
     return (ev_new);
 }
@@ -171,56 +194,15 @@ ptm_event_cleanup (ptm_event_t *event)
     FREE(rmgmtip);
     FREE(rv6addr);
     FREE(rv4addr);
+    FREE(lv6addr);
+    FREE(lv4addr);
+    FREE(vrf_name);
     memset(event, 0, sizeof(ptm_event_t));
 }
 
-#ifdef TEST
-void
-ptm_event_default_handler (ptm_event_t *event)
-{
-    ptm_client_t *client;
-    ptm_client_t *save;
-    //char *str = "world";
-    char str1[100];
-    //int rc;
-    csv_t *csv = NULL;
-    csv_record_t *rec;
-    int len;
-
-    LOG("%s", ptm_event_str(event));
-    switch(event->module) {
-    case CTL_MODULE:
-        /* U-turn the request to the client - just a test */
-        //ptm_ctl_send(event->client, event->client->inbuf,
-        //             event->client->inbuf_len);
-
-        memset(str1, -1, sizeof(str1));
-        client = ptm_client_safe_iter(&save);
-        while (client != NULL) {
-            LOG("client#%d\n", client->fd);
-            csv = csv_init(csv, str1, 100);
-            LOG("client#%d\n", client->fd);
-            rec = ptm_msg_encode_header(csv, NULL, 0, PTM_VERSION);
-            ptm_msg_encode_port_header(csv);
-            csv_encode(csv, 2, "swp1", "pass");
-            csv_encode(csv, 2, "swp2", "pass");
-            csv_encode(csv, 2, "swp3", "pass");
-            len = csvlen(csv);
-            len -= PTM_MSG_HEADER_LENGTH;
-            ptm_msg_encode_header(csv, rec, len, PTM_VERSION);
-            ptm_ctl_send(client, str1, csvlen(csv));
-            csv_clean(csv);
-            client = ptm_client_safe_iter_next(&save);
-        }
-        break;
-    default:
-        break;
-    }
-}
-#endif
-
 ptm_globals_t ptm_g = { {{.init_cb = ptm_init_timer },
                          {.init_cb = ptm_init_lldp },
+                         {.init_cb = ptm_init_nl },
                          {.init_cb = ptm_init_nbr },
                          {.init_cb = ptm_init_quagga },
                          {.init_cb = ptm_init_bfd },
@@ -233,6 +215,7 @@ ptmd_exit (void)
     ptm_globals_t *g = &ptm_g;
 
     PTM_SET_STATE(g, PTM_SHUTDOWN);
+    ptm_lib_deregister(g->ptmlib_hdl);
     if(g->retry_timer)
         cl_timer_destroy(g->retry_timer);
     ptm_g.retry_timer = NULL;
@@ -246,21 +229,21 @@ ptmd_exit (void)
 void
 ptm_fd_cleanup (int fd)
 {
-    if (fd) {
+    if (fd > 0) {
         FD_CLR(fd, &ptm_g.masterset);
         if (fd == ptm_g.maxfd) {
             while (FD_ISSET(ptm_g.maxfd, &ptm_g.masterset) == 0) {
                 ptm_g.maxfd -= 1;
             }
         }
+        close(fd);
     }
-    close(fd);
 }
 
 void
 ptm_fd_add (int fd)
 {
-    if (fd) {
+    if (fd > 0) {
         FD_SET(fd, &ptm_g.masterset);
         if (fd > ptm_g.maxfd) {
             ptm_g.maxfd = fd;
@@ -294,7 +277,7 @@ void ptm_module_handle_event_cb(ptm_event_t *event)
 void ptm_module_request_reinit(void)
 {
     ptm_globals_t *g = &ptm_g;
-    if (PTM_GET_STATE(g) == PTM_SHUTDOWN)
+    if (PTM_GET_STATE(g) != PTM_RUNNING)
         return;
     ptm_queue_init_retry_timer();
 }
@@ -303,10 +286,13 @@ static int
 _fd_to_module (int fd)
 {
     int m;
+    int i;
 
     for (m = 0; m < MAX_MODULE; m++) {
-        if (ptm_g.modules[m].fd == fd) {
-            return (m);
+        for (i = 0; i < MAX_FD; i++) {
+            if (ptm_g.modules[m].fd[i] == fd) {
+                return (m);
+            }
         }
     }
     return (CTL_MODULE);
@@ -317,19 +303,43 @@ ptm_init_mod_fds()
 {
     ptm_globals_t *g = &ptm_g;
     ptm_module_e m;
+    int i;
 
     FD_ZERO(&g->writeset);
     FD_ZERO(&g->masterset);
     g->maxfd = 0;
     for (m = 0; m < MAX_MODULE; m++) {
-        if (g->modules[m].fd != -1) {
-            FD_SET(g->modules[m].fd, &g->masterset);
-            if (g->modules[m].fd > g->maxfd) {
-                g->maxfd = g->modules[m].fd;
+        for (i = 0; i < MAX_FD; i++) {
+            if (g->modules[m].fd[i] != -1) {
+                FD_SET(g->modules[m].fd[i], &g->masterset);
+                if (g->modules[m].fd[i] > g->maxfd) {
+                    g->maxfd = g->modules[m].fd[i];
+                }
             }
-            PTM_MODULE_SET_STATE(g, m, MOD_STATE_RUNNING);
         }
     }
+}
+
+static void
+ptm_handle_reconfig ()
+{
+    ptm_globals_t *g = &ptm_g;
+    int mod;
+
+    if (!g->init_retry_count) {
+        INFOLOG("Starting PTM RECONFIG \n");
+        cl_timer_destroy(g->retry_timer);
+        g->retry_timer = NULL;
+        g->retry_interval = RECONFIG_RETRY_INTERVAL;
+        ptm_queue_init_retry_timer();
+    }
+    /* mark all modules that are not in error state */
+    for (mod=LLDP_MODULE; mod != MAX_MODULE; mod++) {
+        if (PTM_MODULE_GET_STATE(g, mod) != MOD_STATE_ERROR) {
+            PTM_MODULE_SET_STATE(g, mod, MOD_STATE_INITIALIZED);
+        }
+    }
+    PTM_SET_STATE(g, PTM_INIT);
 }
 
 static int
@@ -343,10 +353,15 @@ ptm_do_select ()
     int maxfd;
     ptm_globals_t *g = &ptm_g;
 
-    PTM_SET_STATE(g, PTM_RUNNING);
-    ptm_init_mod_fds();
-
     while (1) {
+
+        /* did we request a reconfig ? */
+        if (PTM_GET_STATE(g) == PTM_RECONFIG) {
+            INFOLOG("SIGUSR1 recd - pending RECONFIG\n");
+            ptm_handle_reconfig ();
+            continue;
+        }
+
         /* local copy allows for late init modules to update global fd list */
         memcpy(&rdset, &g->masterset, sizeof(g->masterset));
         memcpy(&wrset, &g->writeset, sizeof(g->writeset));
@@ -391,31 +406,8 @@ static void
 ptm_sigusr1_cb (int signum)
 {
     ptm_globals_t *g = &ptm_g;
-    int mod;
-
-    DLOG("%s: Signal %d received\n", __FUNCTION__, signum);
 
     PTM_SET_STATE(g, PTM_RECONFIG);
-    ptm_queue_init_retry_timer();
-    ptm_conf_finish ();
-    /* mark all modules that are not in error state */
-    for (mod=LLDP_MODULE; mod != MAX_MODULE; mod++) {
-        if (PTM_MODULE_GET_STATE(g, mod) != MOD_STATE_ERROR) {
-            PTM_MODULE_SET_STATE(g, mod, MOD_STATE_INITIALIZED);
-        }
-    }
-}
-
-static void
-ptm_sigterm_cb (int signum)
-{
-    ptmd_exit();
-}
-
-static void ptm_sighup_cb(int signum)
-{
-    INFOLOG("SIGHUP recieved, reopening log file.\n");
-    log_reopen();
 }
 
 static int
@@ -467,36 +459,48 @@ ptm_init_retry_timer (cl_timer_t *timer,
         DLOG("%s: All Modules Re-initialized \n", __FUNCTION__);
     }
 
-    if (!g->my_hostname || !g->my_mgmtip) {
-        /* hostname/mgmtip missing - delay again */
-        DLOG("%s: Hostname (%s) and/or MgmtIP (%s) "
-             "still missing post-pone config read\n",
-             __FUNCTION__, g->my_hostname, g->my_mgmtip);
-        return;
+    /* attempt to read topo file */
+    ret = ptm_conf_init(g);
+
+    if (ret) {
+        if (!g->my_hostname || !g->my_mgmtip) {
+            /* did not get hostname/ip from lldpd - keep retrying */
+            if (g->init_retry_count == LONG_MAX)
+                g->init_retry_count = MAX_FAST_INIT_RETRY_COUNT;
+            g->init_retry_count++;
+            if (g->init_retry_count == MAX_FAST_INIT_RETRY_COUNT) {
+                INFOLOG("PTM max fast retries done [%d] - "
+                        "switching to slow retry\n",
+                        MAX_FAST_INIT_RETRY_COUNT);
+                cl_timer_destroy(g->retry_timer);
+                g->retry_timer = NULL;
+                g->retry_interval = SLOW_INIT_RETRY_INTERVAL;
+                ptm_queue_init_retry_timer();
+            }
+        } else {
+            /* hostname/ip valid - but topo read failure */
+            INFOLOG("PTM topology file errors - "
+                    "Issue restart/reconfig\n");
+            g->conf_init_done = TRUE;
+        }
     }
 
-    /* build from scratch or just re-parse? */
-    if (!g->conf_init_done)
-        ret = ptm_conf_init(g);
-    else
-        ret = ptm_conf_reparse(g);
-
-    if (!ret) {
-        /* give a chance for each module to populate
-         * with current state/data
-         */
-        for (m = 0; m < MAX_MODULE; m++) {
-            if (PTM_MODULE_GET_STATE(g, m) == MOD_STATE_PARSE) {
-                if (PTM_MODULE_POPULATECB(g, m))
-                    PTM_MODULE_POPULATECB(g, m)(g);
-                else
-                    PTM_MODULE_SET_STATE(g, m, MOD_STATE_POPULATE);
-            }
+    /* give a chance for each module to populate
+     * with current state/data
+     */
+    for (m = 0; m < MAX_MODULE; m++) {
+        if (PTM_MODULE_GET_STATE(g, m) != MOD_STATE_ERROR) {
+            if (PTM_MODULE_POPULATECB(g, m))
+                PTM_MODULE_POPULATECB(g, m)(g);
+            if (PTM_MODULE_GET_STATE(g, m) != MOD_STATE_ERROR)
+                PTM_MODULE_SET_STATE(g, m, MOD_STATE_RUNNING);
         }
     }
 
     if (!ptm_get_error_mods() && g->conf_init_done) {
-        DLOG("%s: Init sequence complete \n", __FUNCTION__);
+        INFOLOG("%s: Init sequence complete \n", __FUNCTION__);
+        g->init_retry_count = 0;
+        g->retry_interval = FAST_INIT_RETRY_INTERVAL;
         cl_timer_destroy(g->retry_timer);
         g->retry_timer = NULL;
         PTM_SET_STATE(g, PTM_RUNNING);
@@ -508,10 +512,14 @@ ptm_init_retry_timer (cl_timer_t *timer,
 static void
 ptm_queue_init_retry_timer()
 {
+    int flags;
     if (!ptm_g.retry_timer) {
         ptm_g.retry_timer = cl_timer_create();
+        flags = T_UF_PERIODIC;
+        if (ptm_g.retry_interval != SLOW_INIT_RETRY_INTERVAL)
+            flags |= T_UF_NSEC;
         cl_timer_arm(ptm_g.retry_timer, ptm_init_retry_timer,
-                     INIT_RETRY_INTERVAL, (T_UF_PERIOIDIC | T_UF_NSEC));
+                     ptm_g.retry_interval, flags);
     }
 }
 
@@ -525,9 +533,9 @@ main (int argc, char *argv[])
     int m, my_pid;
     bool daemonize = FALSE;
     char loglevel[16] = "INFO";
-    char tmplogstr[MAXNAMELEN+sizeof(loglevel)+8];
+    char tmplogstr[sizeof "syslog="+sizeof(loglevel)+8];
     const char *logstr[2];
-    int postpone_init = FALSE;
+    unsigned int retry_mods;
 
     sprintf(file, "%s/%s", PTM_CONF_DIR, PTM_CONF_FILE);
     while ((ch = getopt(argc, argv, "dhc:l:")) != -1) {
@@ -566,16 +574,22 @@ main (int argc, char *argv[])
         }
     }
 
-    sprintf(tmplogstr, "file:%s=%s", PTM_LOGFILE, loglevel);
+    snprintf(tmplogstr, sizeof tmplogstr, "syslog=%s", loglevel);
     logstr[0] = strdupa(tmplogstr);
-    ret = logger_init(logstr, 1);
+    ret = log_init(logstr, 1);
     if (!ret) {
         fprintf(stderr, "Log init failed (%s), exiting.\n", tmplogstr);
         exit(11);
     }
 
-	/* Disable SIGHUP, until handlers are installed */
-	signal(SIGHUP, SIG_IGN);
+    /* Disable SIGHUP, until handlers are installed
+     * This was used to rotate logs.  Leave it ignored, since
+     * we don't want SIGHUP to terminate us if people had
+     * scripts sending HUP directly.
+     */
+    signal(SIGHUP, SIG_IGN);
+
+    INFOLOG("Starting PTM INIT\n");
 
     if (daemonize)
         daemon(0, 0);
@@ -585,9 +599,10 @@ main (int argc, char *argv[])
     fprintf(pid_fp, "%d\n", getpid());
     fflush(pid_fp);
 
+    ptm_g.retry_interval = FAST_INIT_RETRY_INTERVAL;
     PTM_SET_STATE(g, PTM_INIT);
     /* initialize the modules */
-    ptm_g.retry_mods = 0;
+    retry_mods = 0;
     for (m = 0; m < MAX_MODULE; m++) {
         if (PTM_MODULE_INITCB(g, m)) {
             ret = PTM_MODULE_INITCB(g, m)(g);
@@ -595,14 +610,14 @@ main (int argc, char *argv[])
                 /* init failed - retry init */
                 fprintf(stderr, "Module %s init failed \n",
                         ptm_module_string(m));
-                ptm_g.retry_mods |= (1 << m);
+                retry_mods |= (1 << m);
             }
         } else {
             PTM_MODULE_INITIALIZE(g, m);
         }
     }
 
-    if (ptm_g.retry_mods) {
+    if (retry_mods) {
         /* create a timer event to retry failed modules */
         ptm_queue_init_retry_timer();
     }
@@ -610,36 +625,32 @@ main (int argc, char *argv[])
     atexit(ptmd_exit);
 
     strcpy(g->topo_file, file);
-    LOG("Local host name %s, IP %s\n", g->my_hostname, g->my_mgmtip);
-    if (!g->my_hostname || !g->my_mgmtip) {
-        DLOG("On init: No local hostname or IP retrieved yet");
-        g->conf_init_done = FALSE;
-        postpone_init = TRUE;
+    INFOLOG("Local host name %s, IP %s\n", g->my_hostname, g->my_mgmtip);
+
+    /* attempt to read topo file */
+    ret = ptm_conf_init(g);
+
+    if (ret) {
+        ptm_queue_init_retry_timer();
     }
 
-    if (!postpone_init) {
-        ret = ptm_conf_init(g);
-
-        if (ret) {
-            /* conf read failed - retry in timer */
-            ptm_queue_init_retry_timer();
-        } else {
-            /* give a chance for each module to populate
-             * with current state/data
-             */
-            for (m = 0; m < MAX_MODULE; m++) {
-                /* if a module is pending retry ignore it */
-                if (!!(ptm_g.retry_mods & (1 << m)))
-                    continue;
-                if (PTM_MODULE_POPULATECB(g, m))
-                    PTM_MODULE_POPULATECB(g, m)(g);
-            }
-        }
+    /* give a chance for each module to populate
+     * with current state/data
+     */
+    for (m = 0; m < MAX_MODULE; m++) {
+        /* if a module is pending retry ignore it */
+        if (!!(retry_mods & (1 << m)))
+            continue;
+        if (PTM_MODULE_POPULATECB(g, m))
+            PTM_MODULE_POPULATECB(g, m)(g);
+        PTM_MODULE_SET_STATE(g, m, MOD_STATE_RUNNING);
     }
+
+    PTM_SET_STATE(g, PTM_RUNNING);
+
+    ptm_init_mod_fds();
 
     ptm_set_signal_handler(SIGUSR1, ptm_sigusr1_cb);
-    ptm_set_signal_handler(SIGTERM, ptm_sigterm_cb);
-    ptm_set_signal_handler(SIGHUP, ptm_sighup_cb);
     ptm_do_select();
 
     return (ret);

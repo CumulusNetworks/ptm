@@ -1,18 +1,46 @@
+# Copyright 2016,2017 Cumulus Networks, Inc. All rights reserved.
+#
+# This file is licensed to You under the Eclipse Public License (EPL);
+# You may not use this file except in compliance with the License. You
+# may obtain a copy of the License at
+# http://www.opensource.org/licenses/eclipse-1.0.php
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
+m4_define([libptm_lt_current],    [3])
+m4_define([libptm_lt_revision],   [0])
+m4_define([libptm_lt_age],        [0])
+
 AC_PREREQ([2.69])
-AC_INIT([ptm], [1.0], [BUG-REPORT-ADDRESS])
-AM_INIT_AUTOMAKE(ptmd, 1.0)
+AC_INIT([ptm], [3.0], [BUG-REPORT-ADDRESS])
+#AM_INIT_AUTOMAKE(ptmd, 3.0)
+AM_INIT_AUTOMAKE([-Wall foreign subdir-objects])
+AC_CONFIG_MACRO_DIR([m4])
 AC_C_BIGENDIAN
 AC_CONFIG_SRCDIR([src/ptm_conf.h])
 AC_CONFIG_HEADERS([config.h])
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES(yes)])
+m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
+
+AC_ARG_WITH([pkgconfigdir], AS_HELP_STRING([--with-pkgconfigdir=PATH],
+	[Path to the pkgconfig directory [[LIBDIR/pkgconfig]]]),
+	[pkgconfigdir="$withval"], [pkgconfigdir='$(libdir)/pkgconfig'])
+AC_SUBST([pkgconfigdir])
+
+LT_CURRENT=libptm_lt_current
+AC_SUBST(LT_CURRENT)
+LT_REVISION=libptm_lt_revision
+AC_SUBST(LT_REVISION)
+LT_AGE=libptm_lt_age
+AC_SUBST(LT_AGE)
+
+#Configure libtool
+LT_INIT
 
 # Checks for programs.
 AC_PROG_CXX
 AC_PROG_CC
 AC_PROG_LN_S
-AC_PROG_RANLIB
 
 AM_PATH_PYTHON([2.7],,AC_MSG_ERROR("Python required for building"))
 
@@ -44,5 +72,4 @@ AC_CHECK_LIB(cgraph,agfstout)
 AC_CHECK_LIB(lldpctl, lldpctl_atom_dec_ref)
 AC_CHECK_LIB(lldpctl, lldpctl_process_conn_buffer, [], AC_MSG_ERROR([Need LLDPD > 0.7.10]))
 
-AC_OUTPUT(Makefile src/Makefile lib/Makefile)
-
+AC_OUTPUT(Makefile lib/log/Makefile lib/ptmlib/Makefile lib/ptmlib/libptm.pc src/Makefile)

@@ -1,5 +1,11 @@
 /*********************************************************************
- * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+ * Copyright 2013 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2014,2015,2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
  *
  * ptm_lldp.[ch] contain the code that interacts with LLDPD over
  * the LLDPCTL interface, extract the required information,
@@ -17,6 +23,7 @@
 #include "ptm_event.h"
 #include "ptm_timer.h"
 #include "ptm_conf.h"
+#include "ptm_lib.h"
 #include "ptm_lldp.h"
 #include "ptm_ctl.h"
 #include "lldpctl.h"
@@ -24,24 +31,33 @@
 #include "log.h"
 
 static int lldp_parse_match_type(lldp_parms_t *parms, char *val);
+static int lldp_parse_match_hostname(lldp_parms_t *parms, char *val);
 static int ptm_populate_lldp ();
 static int ptm_process_lldp (int in_fd, ptm_sockevent_e se, void *udata);
 static int ptm_parse_lldp(struct ptm_conf_port *port, char *args);
-static int ptm_status_lldp(csv_t *, csv_record_t **, csv_record_t **,
-                           char *, void *);
-static int ptm_debug_lldp(csv_t *, csv_record_t **, csv_record_t **,
-                          char *, void *, char *);
-static void ptm_start_lldp_resync_timer(void);
-static void ptm_stop_lldp_resync_timer(void);
-static int ptm_lldp_resync_nbrs(void);
+static int ptm_status_lldp(void *, void *, void *);
+static int ptm_lldp_sync_nbrs(void);
+static lldp_cache_port *ptm_lldp_alloc_cache_lport(char *, lldpctl_atom_t *,
+                                                   ptm_event_t *);
+static int ptm_lldp_build_cache_lport_list(void);
+static void ptm_lldp_free_cache_lport(lldp_cache_port *);
+static void ptm_lldp_free_cache_lport_by_liface(char *);
+static void ptm_lldp_free_cache_lport_list(void);
+static void ptm_lldp_free_non_existent_ports(void);
 
-/* This needs the latest LLDPd from https://github.com/vincentbernat/lldpd */
-extern int lldpctl_process_conn_buffer(lldpctl_conn_t *conn);
+//#define LLDPCTL_DEBUG 1
+
+#ifdef LLDPCTL_DEBUG
+void ptm_lldpctl_log(int severity, const char *msg);
+#else
+void ptm_lldpctl_log(int severity, const char *msg) {}
+#endif
 
 lldp_parms_hash_t *lldp_parms_hash = NULL;
 
 lldp_parms_key_t lldp_parms_key[] = {
         { .key = "match_type", .key_cb = lldp_parse_match_type },
+        { .key = "match_hostname", .key_cb = lldp_parse_match_hostname },
         { .key = NULL, .key_cb = NULL},
 };
 
@@ -51,14 +67,19 @@ match_type_list type_list[] = {
         { .str = NULL },
 };
 
+match_hostname_list hostname_list[] = {
+        { .str = "hostname", .type = PTM_HOST_NAME_TYPE_HOSTNAME},
+        { .str = "fqdn", .type = PTM_HOST_NAME_TYPE_FQDN},
+        { .str = NULL },
+};
+
 char *LLDP_TEMPLATE_KEY = "lldptmpl";
 
-/**
- * Do a periodic lazy sync - incase we missed any events
- */
-#define LLDPD_PERIODIC_RESYNC_INTERVAL  300
+#define MOD_LLDP_RETRY_COUNT  5
 
-#define MOD_RETRY_DISPLAY_INTERVAL  5
+#define LLDP_MAX_IFACE_PER_LOOP 20
+/* LLDP iface processing interval */
+#define LLDP_IFACE_INTERVAL (100 * NSEC_PER_MSEC)
 
 /**
  * Global structure (private to this file) for bookkeeping - init params,
@@ -68,16 +89,18 @@ typedef struct {
     lldpctl_conn_t  *conn;
     ptm_globals_t   *gbl;
     ptm_event_t     event;
-    uint64_t        num_notifs;
-    uint64_t        num_lldp_restarts;
+    int             resync;
+    int             in_cache_loop;
+    void            *iface_timer;
     lldp_parms_t    parms;
-    cl_timer_t      *resync_timer;
     unsigned int    mod_retry_cnt;
+    char            err_str[256];
 } ptm_lldp_globals_t;
 
 ptm_lldp_globals_t ptm_lldp;
 
 lldp_port *lldp_port_hash = NULL;
+lldp_cache_port *lldp_port_cache_hash = NULL;
 
 cl_timer_t *ptm_timer_cb_lldp(cl_timer_t *timer, void *context);
 
@@ -129,31 +152,37 @@ _extract_event (ptm_event_t *event,
 
     if (strcmp(lldp_str, "LLDP")){
         DLOG("%s: Expected (LLDP) != Recd (%s) - dropping event \n",
-            __FUNCTION__, lldp_str);
+                __FUNCTION__, lldp_str);
         return (-1);
     }
 
     event->type = type;
     event->module = LLDP_MODULE;
-    event->liface = strdup(lldpctl_atom_get_str(interface,
-                                             lldpctl_k_interface_name));
-    event->riface = strdup(lldpctl_atom_get_str(neighbor,
-                                             lldpctl_k_port_id));
-    /* port description is not mandatory */
+    buf = lldpctl_atom_get_str(interface, lldpctl_k_interface_name);
+    if (buf)
+        event->liface = strdup(buf);
+    buf = lldpctl_atom_get_str(neighbor, lldpctl_k_port_id);
+    if (buf)
+        event->riface = strdup(buf);
     buf = lldpctl_atom_get_str(neighbor, lldpctl_k_port_descr);
+    /* Port Descr TLV is not mandatory and can be NULL */
     if (buf)
         event->rdescr = strdup(buf);
-    event->rname = strdup(lldpctl_atom_get_str(neighbor,
-                                             lldpctl_k_chassis_name));
+    buf = lldpctl_atom_get_str(neighbor, lldpctl_k_chassis_name);
+    if (buf)
+        event->rname = strdup(buf);
     if (lldpctl_atom_get_int(neighbor, lldpctl_k_port_id_subtype) ==
         LLDP_PORTID_SUBTYPE_LLADDR) {
-        event->rmac = strdup(lldpctl_atom_get_str(neighbor,
-                                             lldpctl_k_port_id));
+        buf = lldpctl_atom_get_str(neighbor, lldpctl_k_port_id);
+        if (buf)
+            event->rmac = strdup(buf);
     }
     mgmts = mgmt = NULL;
     mgmts = lldpctl_atom_get(neighbor, lldpctl_k_chassis_mgmt);
     lldpctl_atom_foreach(mgmts, mgmt) {
-        event->rmgmtip = strdup(lldpctl_atom_get_str(mgmt, lldpctl_k_mgmt_ip));
+        buf = lldpctl_atom_get_str(mgmt, lldpctl_k_mgmt_ip);
+        if (buf)
+            event->rmgmtip = strdup(buf);
         break;
     }
 
@@ -166,74 +195,364 @@ _extract_event (ptm_event_t *event,
 }
 
 /**
- * Callback passed to LLDPCTL as part of watch registration.
- *   Gets called when LLDPD sends a notification to the client about some
- *   change.
+ * Routine to handle LLDP event data
+ * If data=1    - called by lldpctl to notify about a change
+ * If data=NULL - called by ptm internally
  */
 static void
-watch_lldp_neighbors_cb (lldpctl_conn_t *conn,
-                         lldpctl_change_t type,
-                         lldpctl_atom_t *interface,
-                         lldpctl_atom_t *neighbor,
-                         void *data)
+process_lldp_neighbors_cb (lldpctl_conn_t *conn,
+                           lldpctl_change_t type,
+                           lldpctl_atom_t *interface,
+                           lldpctl_atom_t *neighbor,
+                           void *data)
 {
-
-    ptm_lldp.num_notifs++;
+    ptm_event_t *ev;
+    int lldp_notify = (data)?1:0;
 
     if (!_extract_event(&ptm_lldp.event, lldp_type_to_ptm_event_type(type),
-                         interface, neighbor)) {
+                        interface, neighbor)) {
         if (ptm_lldp.event.liface &&
-            (ptm_lldp.event.riface || ptm_lldp.event.rdescr))
-            ptm_module_handle_event_cb(&ptm_lldp.event);
-        else
-            ERRLOG("%s: local iface and remote iface/descr not set\n",
-                __FUNCTION__);
+            ptm_lldp.event.rname &&
+            (ptm_lldp.event.riface || ptm_lldp.event.rdescr)) {
+            if (lldp_notify && ptm_lldp.in_cache_loop) {
+                /* we are in cache loop, and this is a lldpctl notification
+                 * add this event to the cache list, we will process it later
+                 */
+                ev = ptm_event_clone(&ptm_lldp.event);
+                INFOLOG("LLDP %s for iface %s - add to cache\n",
+                        ptm_event_type_str(ev->type), ptm_lldp.event.liface);
+                /* grab a reference */
+                lldpctl_atom_inc_ref(interface);
+                ptm_lldp_alloc_cache_lport(ptm_lldp.event.liface,
+                                           interface, ev);
+            } else {
+                /* not a lldp notification
+                 * OR
+                 * not in cache loop
+                 */
+                if (!ptm_lldp.in_cache_loop) {
+                    /* remove from cache if present */
+                    ptm_lldp_free_cache_lport_by_liface(ptm_lldp.event.liface);
+                }
+                /* process the event */
+                ptm_module_handle_event_cb(&ptm_lldp.event);
+            }
+        } else {
+            if (!ptm_lldp.event.liface) {
+                ERRLOG("%s: local iface not set\n", __FUNCTION__);
+            } else if (!ptm_lldp.event.rname) {
+                ERRLOG("%s: remote sysname not set\n", __FUNCTION__);
+            } else if (!ptm_lldp.event.riface || !ptm_lldp.event.rdescr) {
+                ERRLOG("%s: remote iface/port descr not set\n", __FUNCTION__);
+            }
+        }
     }
     ptm_event_cleanup(&ptm_lldp.event);
 }
 
-/**
- * Get a dump of local interfaces and neighbors from LLDPD. Typically called
- * at initialization time.
- */
 static int
-get_lldp_neighbor_list (lldpctl_conn_t *conn)
+process_cache_lport(lldp_cache_port *cache_lport)
 {
-    lldpctl_atom_t *iface_list = NULL;
-    lldpctl_atom_t *iface = NULL;
+    lldpctl_conn_t  *conn = ptm_lldp.conn;
     lldpctl_atom_t *port = NULL;
     lldpctl_atom_t *neighbors = NULL;
     lldpctl_atom_t *neighbor = NULL;
+    char liface[MAXNAMELEN+1];
+
+    strcpy(liface, cache_lport->liface);
+
+    /* if event is available , use it */
+    if (cache_lport->ev) {
+        ptm_module_handle_event_cb(cache_lport->ev);
+        ptm_event_cleanup(cache_lport->ev);
+        cache_lport->ev = NULL;
+        return 0;
+    }
+
+    port = lldpctl_get_port(cache_lport->iface);
+
+    /* its possible that during the lldpctl_get_port call
+     * this cache_lport got updated with an event
+     * we check to see if it got a new "event" reference
+     */
+    if (cache_lport->ev) {
+        ptm_module_handle_event_cb(cache_lport->ev);
+        ptm_event_cleanup(cache_lport->ev);
+        cache_lport->ev = NULL;
+        return 0;
+    }
+
+    /* no new event, just process like a regular lport */
+
+    if (port == NULL) {
+        INFOLOG("No lldp port for iface %s - lldpctl[%s]\n",
+                liface, lldpctl_last_strerror(conn));
+        return 0;
+    }
+
+    /* sanity check returned data */
+    if (strcmp(lldpctl_atom_get_str(port, lldpctl_k_port_name), liface)) {
+        ERRLOG("%s: lldpctl error - portname [%s] != liface [%s]\n",
+                __FUNCTION__,
+                lldpctl_atom_get_str(port, lldpctl_k_port_name),
+                liface);
+        lldpctl_atom_dec_ref(port);
+        return -1;
+    }
+
+    neighbors = lldpctl_atom_get(port, lldpctl_k_port_neighbors);
+    lldpctl_atom_foreach(neighbors, neighbor) {
+        process_lldp_neighbors_cb(conn, lldpctl_c_added,
+                                  cache_lport->iface, neighbor, NULL);
+    }
+    if (neighbors)
+        lldpctl_atom_dec_ref(neighbors);
+    if (port)
+        lldpctl_atom_dec_ref(port);
+
+    return 0;
+}
+
+static void
+ptm_lldp_iface_timer (cl_timer_t *timer,
+                      void *context)
+{
+    int ret;
+
+    ptm_lldp.in_cache_loop = 1;
+
+    ret = ptm_lldp_sync_nbrs();
+
+    ptm_lldp.in_cache_loop = 0;
+
+    if (ret) {
+        sprintf(ptm_lldp.err_str, "%s: LLDPCTL sync failed - retry",
+            __FUNCTION__);
+        ptm_shutdown_lldp();
+    }
+}
+
+/* routine used to arm (or re-arm) the iface timer */
+static void
+ptm_lldp_queue_iface_timer()
+{
+    if (!ptm_lldp.iface_timer) {
+        ptm_lldp.iface_timer = cl_timer_create();
+        cl_timer_arm(ptm_lldp.iface_timer, ptm_lldp_iface_timer,
+                     LLDP_IFACE_INTERVAL,
+                     (T_UF_PERIODIC | T_UF_NSEC));
+    }
+}
+
+static void
+ptm_lldp_free_iface_timer()
+{
+    if (ptm_lldp.iface_timer) {
+        cl_timer_destroy(ptm_lldp.iface_timer);
+        ptm_lldp.iface_timer = NULL;
+    }
+}
+
+static void
+ptm_lldp_free_cache_lport(lldp_cache_port *cache_lport)
+{
+    HASH_DELETE(pch, lldp_port_cache_hash, cache_lport);
+    if (cache_lport->ev)
+        ptm_event_cleanup(cache_lport->ev);
+    if (cache_lport->iface)
+        lldpctl_atom_dec_ref(cache_lport->iface);
+    free(cache_lport);
+}
+
+static void
+ptm_lldp_free_cache_lport_by_liface(char *liface)
+{
+    lldp_cache_port *cache_lport;
+    HASH_FIND(pch, lldp_port_cache_hash, liface,
+              strlen(liface), cache_lport);
+    if (cache_lport)
+        ptm_lldp_free_cache_lport(cache_lport);
+}
+
+static void
+ptm_lldp_free_cache_lport_list(void)
+{
+    lldp_cache_port *cache_lport, *tmp;
+
+    DLOG("%s: free lldp cache\n", __FUNCTION__);
+
+    HASH_ITER(pch, lldp_port_cache_hash, cache_lport, tmp) {
+        ptm_lldp_free_cache_lport(cache_lport);
+    }
+}
+
+/* allocate a lldp cache port struct */
+static lldp_cache_port *
+ptm_lldp_alloc_cache_lport(char *liface, lldpctl_atom_t *iface,
+                           ptm_event_t *ev)
+{
+    lldp_cache_port *cache_lport;
+
+    HASH_FIND(pch, lldp_port_cache_hash, liface, strlen(liface), cache_lport);
+
+    if (cache_lport) {
+        if (cache_lport->iface != iface) {
+            /* remove old reference */
+            lldpctl_atom_dec_ref(cache_lport->iface);
+        }
+        cache_lport->iface = iface;
+        if ((cache_lport->ev) &&
+            (cache_lport->ev != ev)) {
+            /* remove old event struct */
+            ptm_event_cleanup(cache_lport->ev);
+        }
+        cache_lport->ev = ev;
+        return cache_lport;
+    }
+
+    cache_lport = calloc(1, sizeof(*cache_lport));
+
+    if (cache_lport) {
+        strcpy(cache_lport->liface, liface);
+        cache_lport->iface = iface;
+        cache_lport->ev = ev;
+        HASH_ADD(pch, lldp_port_cache_hash, liface,
+                 strlen(liface), cache_lport);
+    }
+
+    return cache_lport;
+}
+
+static int
+ptm_lldp_build_cache_lport_list(void)
+{
+    lldpctl_conn_t *conn = ptm_lldp.conn;
+    lldpctl_atom_t *iface_list = NULL;
+    lldpctl_atom_t *iface = NULL;
     lldpctl_atom_iter_t *iter = NULL;
+    lldp_cache_port *cache_lport;
+    char liface[MAXNAMELEN+1];
+
+    DLOG("%s: build lldp cache\n", __FUNCTION__);
+
+    /* first free up the previous cache list */
+    ptm_lldp_free_cache_lport_list();
+
+    iface_list = lldpctl_get_interfaces(conn);
+    if (!iface_list) {
+        ERRLOG("No iface list from LLDP - lldpctl[%s]\n",
+                lldpctl_last_strerror(conn));
+        return (-1);
+    }
+    iter = lldpctl_atom_iter(iface_list);
+
+    /* run through all the lldp interfaces
+     * and create a cache lport per interface
+     */
+    while (iter != NULL) {
+        iface = lldpctl_atom_iter_value(iface_list, iter);
+        iter = lldpctl_atom_iter_next(iface_list, iter);
+        strcpy(liface, lldpctl_atom_get_str(iface, lldpctl_k_interface_name));
+        if (!ptm_conf_get_port_by_name(liface)) {
+            /* this port not configured in topo file */
+            DLOG("%s: topo port not present for iface %s\n",
+                    __FUNCTION__, liface);
+            lldpctl_atom_dec_ref(iface);
+            continue;
+        }
+
+        /* allocate a cached lport */
+        cache_lport = ptm_lldp_alloc_cache_lport(liface, iface, NULL);
+        if (!cache_lport) {
+            ERRLOG("%s: No l_port allocated for iface %s\n",
+                   __FUNCTION__, liface);
+            lldpctl_atom_dec_ref(iface);
+            continue;
+        }
+    }
+    lldpctl_atom_dec_ref(iface_list);
+
+    return 0;
+}
+
+/**
+ * sync info from LLDPD.
+ */
+static int
+ptm_lldp_sync_nbrs(void)
+{
+    lldpctl_conn_t *conn = ptm_lldp.conn;
+    lldpctl_atom_t *config;
+    lldp_cache_port *cache_lport, *tmp;
+    char liface[MAXNAMELEN+1];
+    int iface_processed = 0;
+    int done = FALSE;
 
     if (!conn) {
         return (-1);
     }
-    iface_list = lldpctl_get_interfaces(conn);
-    if (!iface_list) {
-        ERRLOG("initial pull from LLDP failed (%s)\n",
+
+    INFOLOG("%s: sync lldp nbrs\n", __FUNCTION__);
+
+    config = lldpctl_get_configuration(conn);
+    if (config == NULL) {
+        ERRLOG("lldpctl_get_configuration failed - lldpctl[%s]\n",
                lldpctl_last_strerror(conn));
         return (-1);
     }
-
-    iter = lldpctl_atom_iter(iface_list);
-    while (iter != NULL) {
-        iface = lldpctl_atom_iter_value(iface_list, iter);
-        port = lldpctl_get_port(iface);
-        neighbors = lldpctl_atom_get(port, lldpctl_k_port_neighbors);
-        lldpctl_atom_foreach(neighbors, neighbor) {
-            watch_lldp_neighbors_cb(conn, lldpctl_c_added, iface, neighbor,
-                                    NULL);
-        }
-        if (neighbors)
-            lldpctl_atom_dec_ref(neighbors);
-        if (port)
-            lldpctl_atom_dec_ref(port);
-
-        lldpctl_atom_dec_ref(iface);
-        iter = lldpctl_atom_iter_next(iface_list, iter);
+    if (lldpctl_atom_get_int(config, lldpctl_k_config_paused)) {
+        lldpctl_atom_dec_ref(config);
+        INFOLOG("%s : LLDP is paused\n", __FUNCTION__);
+        return (-1);
     }
-    lldpctl_atom_dec_ref(iface_list);
+    lldpctl_atom_dec_ref(config);
+
+    /* do we need to re-sync with lldp? */
+    if (ptm_lldp.resync) {
+        if (ptm_lldp_build_cache_lport_list() < 0) {
+            return (-1);
+        }
+        ptm_lldp.resync = FALSE;
+    }
+
+    /* process cache lports */
+    while (!done) {
+
+        HASH_ITER(pch, lldp_port_cache_hash, cache_lport, tmp) {break;}
+
+        if (!cache_lport) {
+            done = TRUE;
+            break;
+        }
+
+        /* make copy of in-process liface */
+        strcpy(liface, cache_lport->liface);
+
+        if (process_cache_lport(cache_lport) == 0) {
+            iface_processed++;
+
+            /* delete the cache copy (if still present) */
+            HASH_FIND(pch, lldp_port_cache_hash, liface,
+                      strlen(liface), cache_lport);
+            if (cache_lport)
+                ptm_lldp_free_cache_lport(cache_lport);
+        }
+
+        if (iface_processed >= LLDP_MAX_IFACE_PER_LOOP) {
+            INFOLOG("%d LLDP entries processed - defer\n",
+                    iface_processed);
+            ptm_lldp_queue_iface_timer();
+            return (0);
+        }
+    }
+
+    if (!HASH_CNT(pch, lldp_port_cache_hash)) {
+        /* if we got here, then we finished processing cache list */
+        ptm_lldp_free_iface_timer();
+
+        /* clean up lports that dont have ptm ports */
+        ptm_lldp_free_non_existent_ports();
+    }
 
     return(0);
 }
@@ -250,12 +569,26 @@ get_local_params (lldpctl_conn_t *conn)
     lldpctl_atom_t *mgmts = NULL;
     lldpctl_atom_t *mgmt = NULL;
     lldpctl_atom_iter_t *iter = NULL;
+    lldpctl_atom_t *config;
     int found = 0;
+    const char *buf;
 
+    config = lldpctl_get_configuration(conn);
+    if (config == NULL) {
+        ERRLOG("lldpctl_get_configuration failed - lldpctl[%s]\n",
+                lldpctl_last_strerror(conn));
+        return (-1);
+    }
+    if (lldpctl_atom_get_int(config, lldpctl_k_config_paused)) {
+        lldpctl_atom_dec_ref(config);
+        INFOLOG("%s : LLDP is paused\n", __FUNCTION__);
+        return (-1);
+    }
+    lldpctl_atom_dec_ref(config);
     iface_list = lldpctl_get_interfaces(conn);
     if (!iface_list) {
-        ERRLOG("%s : lldpctl_get_interfaces from LLDP failed (%s)\n",
-               __FUNCTION__, lldpctl_last_strerror(conn));
+        ERRLOG("lldpctl_get_interfaces failed - lldpctl[%s]\n",
+               lldpctl_last_strerror(conn));
         return (-1);
     }
 
@@ -264,33 +597,35 @@ get_local_params (lldpctl_conn_t *conn)
         iface = lldpctl_atom_iter_value(iface_list, iter);
         port = lldpctl_get_port(iface);
         if (port == NULL) {
-            ERRLOG("%s: lldp error - can't find port for iface\n",
-                   __FUNCTION__);
+            ERRLOG("No lldp port for iface %s - lldpctl[%s]\n",
+                   lldpctl_atom_get_str(iface, lldpctl_k_interface_name),
+                   lldpctl_last_strerror(conn));
             lldpctl_atom_dec_ref(iface);
+            iter = lldpctl_atom_iter_next(iface_list, iter);
             continue;
         }
-        if (!found) {
-            ptm_lldp.gbl->my_hostname =
-                strdup(lldpctl_atom_get_str(port, lldpctl_k_chassis_name));
-            if (strlen(ptm_lldp.gbl->my_hostname))
-                found = 1;
-
+        mgmts = mgmt = NULL;
+        buf = lldpctl_atom_get_str(port, lldpctl_k_chassis_name);
+        if (buf) {
+            ptm_lldp.gbl->my_hostname = strdup(buf);
             mgmts = lldpctl_atom_get(port, lldpctl_k_chassis_mgmt);
             lldpctl_atom_foreach(mgmts, mgmt) {
-                ptm_lldp.gbl->my_mgmtip =
-                    strdup(lldpctl_atom_get_str(mgmt, lldpctl_k_mgmt_ip));
-                if (strlen(ptm_lldp.gbl->my_mgmtip)) {
+                buf = lldpctl_atom_get_str(mgmt, lldpctl_k_mgmt_ip);
+                if (buf) {
+                    ptm_lldp.gbl->my_mgmtip = strdup(buf);
                     found = 1;
                     break;
                 }
             }
-            if (mgmt)
-                lldpctl_atom_dec_ref(mgmt);
-            if (mgmts)
-                lldpctl_atom_dec_ref(mgmts);
         }
+        if (mgmt)
+            lldpctl_atom_dec_ref(mgmt);
+        if (mgmts)
+            lldpctl_atom_dec_ref(mgmts);
+
         lldpctl_atom_dec_ref(iface);
         lldpctl_atom_dec_ref(port);
+
         break;
     }
     lldpctl_atom_dec_ref(iface_list);
@@ -307,6 +642,10 @@ ptm_shutdown_lldp ()
 {
     lldp_port *l_port, *tmp;
 
+    if (strlen(ptm_lldp.err_str)) {
+        INFOLOG("Shutting down LLDP socket [%s]\n", ptm_lldp.err_str);
+    }
+
     if (ptm_lldp.conn) {
         lldpctl_release(ptm_lldp.conn);
         ptm_lldp.conn = NULL;
@@ -316,15 +655,27 @@ ptm_shutdown_lldp ()
      *  this fd from the select list, or we get into an infinite loop
      *  with select waking us up again and again.
      */
-    ptm_fd_cleanup(PTM_MODULE_FD(ptm_lldp.gbl, LLDP_MODULE));
-    PTM_MODULE_SET_FD(ptm_lldp.gbl, -1, LLDP_MODULE);
+    ptm_fd_cleanup(PTM_MODULE_FD(ptm_lldp.gbl, LLDP_MODULE, 0));
+    PTM_MODULE_SET_FD(ptm_lldp.gbl, -1, LLDP_MODULE, 0);
 
     HASH_ITER(ph, lldp_port_hash, l_port, tmp) {
         HASH_DELETE(ph, lldp_port_hash, l_port);
         free(l_port);
     }
 
-    ptm_stop_lldp_resync_timer();
+    ptm_lldp_free_cache_lport_list();
+
+    if (ptm_lldp.gbl->my_hostname) {
+        free(ptm_lldp.gbl->my_hostname);
+        ptm_lldp.gbl->my_hostname = NULL;
+    }
+
+    if (ptm_lldp.gbl->my_mgmtip) {
+        free(ptm_lldp.gbl->my_mgmtip);
+        ptm_lldp.gbl->my_mgmtip = NULL;
+    }
+
+    ptm_lldp_free_iface_timer();
 
     PTM_MODULE_SET_STATE(ptm_lldp.gbl, LLDP_MODULE, MOD_STATE_ERROR);
     /* request a re-init */
@@ -342,7 +693,7 @@ ptm_lldp_send_cb (lldpctl_conn_t *conn,
                   size_t length,
                   void *user_data)
 {
-    int fd = PTM_MODULE_FD(ptm_lldp.gbl, LLDP_MODULE);
+    int fd = PTM_MODULE_FD(ptm_lldp.gbl, LLDP_MODULE, 0);
     int each_len = 0;
     int rc;
     int retries = 0;
@@ -357,7 +708,7 @@ ptm_lldp_send_cb (lldpctl_conn_t *conn,
             }
 
             if (retries++ < 5) {
-                usleep(100);
+                usleep(2000);
                 continue;
             }
             return (each_len);
@@ -381,7 +732,7 @@ ptm_lldp_recv_cb (lldpctl_conn_t *conn,
                   size_t length,
                   void *user_data)
 {
-    int fd = PTM_MODULE_FD(ptm_lldp.gbl, LLDP_MODULE);
+    int fd = PTM_MODULE_FD(ptm_lldp.gbl, LLDP_MODULE, 0);
     int each_len = 0;
     int rc;
     int retries = 0;
@@ -401,34 +752,53 @@ ptm_lldp_recv_cb (lldpctl_conn_t *conn,
                 return (-1);
             } else {
                 if (retries++ < 5) {
-                    usleep(100);
+                    usleep(2000);
                     continue;
                 }
+                DLOG("max retries - recv error(%d - %s) bytes read %d (%d)\n",
+                     errno, strerror(errno), each_len, (int)length);
                 return (each_len);
             }
         } else {
             each_len += rc;
         }
     }
+
     return (each_len);
 }
 
 #define UPDATE_FIELD(d, s) \
-            if (event->s) strncpy(l_port->d, event->s, sizeof(l_port->d));\
+            if (event->s) strncpy(l_port->d, event->s, sizeof(l_port->d)); \
             else strncpy(l_port->d, "N/A", sizeof(l_port->d))
 
 static void
-handle_lldp_event_add_update(ptm_event_t *event)
+copy_event_to_lport(ptm_event_t *event, lldp_port *l_port)
 {
+    UPDATE_FIELD(liface, liface);
+    UPDATE_FIELD(port_name, riface);
+    UPDATE_FIELD(port_descr, rdescr);
+    UPDATE_FIELD(mac_addr, rmac);
+    UPDATE_FIELD(ipv4_addr, rv4addr);
+    UPDATE_FIELD(ipv6_addr, rv6addr);
+    UPDATE_FIELD(sys_name, rname);
+    time(&l_port->last_change_time);
+}
+
+static void
+handle_lldp_event_add(ptm_event_t *event)
+{
+    ptm_status_ctxt_t p_ctxt = {0};
     lldp_parms_hash_t *entry = NULL;
     ptm_conf_port_t *port = NULL;
-    struct ptm_conf_nbr *nbr;
     lldp_port *l_port = NULL;
     bool existing = FALSE;
     char *port_ident_str;
+    bool update = FALSE;
+    lldp_match_type_t match_type;
+    int match_hostname;
 
-    DLOG("LLDP Received %s event for port %s\n",
-         (event->type == EVENT_ADD)?"ADD":"UPD", event->liface);
+    INFOLOG("Recd LLDP ADD event for port %s remote [%s - %s]\n",
+         event->liface, event->rname, event->riface);
 
     port = ptm_conf_get_port(event);
     if (!port) {
@@ -436,86 +806,101 @@ handle_lldp_event_add_update(ptm_event_t *event)
         return;
     }
 
-    nbr = &port->admin;
-
     HASH_FIND(ph, lldp_port_hash, port->port_name,
               strlen(port->port_name), l_port);
 
     if (l_port)
         existing = TRUE;
 
-    if (event->type == EVENT_ADD) {
-        /* allocate a new lldp port struct */
-        if (!existing) {
-            if ((l_port = calloc(1, sizeof(*l_port))) == NULL) {
-                ERRLOG("Can't malloc memory for new LLDP port: %s\n",
-                        nbr->port_ident);
-                return;
-            }
-        }
-    } else if (!existing) {
-        DLOG("%s: LLDP Port %s not found \n", __FUNCTION__, event->liface);
-        return;
-    }
-
-    UPDATE_FIELD(liface, liface);
-    UPDATE_FIELD(sys_name, rname);
-    UPDATE_FIELD(port_name, riface);
-    UPDATE_FIELD(port_descr, rdescr);
-    UPDATE_FIELD(mac_addr, rmac);
-    UPDATE_FIELD(ipv4_addr, rv4addr);
-    UPDATE_FIELD(ipv6_addr, rv6addr);
-
     /* see if any LLDP parms associated with this port */
     HASH_FIND(ph, lldp_parms_hash, port->port_name,
             strlen(port->port_name), entry);
 
-    l_port->match_type =
+    match_type =
         (entry)?entry->parms.match_type:ptm_lldp.parms.match_type;
-
-    if (event->type == EVENT_ADD) {
-        if (!existing) {
-            HASH_ADD(ph, lldp_port_hash, liface,
-                    strlen(l_port->liface), l_port);
-        }
-    }
-
-    if (!existing)
-        time(&l_port->last_change_time);
+    match_hostname =
+        (entry)?entry->parms.match_hostname:ptm_lldp.parms.match_hostname;
 
     /* compare with ptm conf and see if topo action needs to be called */
-    if (l_port->match_type == PORT_DESCRIPTION) {
-        port_ident_str = l_port->port_descr;
+    if (match_type == PORT_DESCRIPTION) {
+        port_ident_str = event->rdescr;
     } else {
-        port_ident_str = l_port->port_name;
+        port_ident_str = event->riface;
     }
 
-    if ((strcmp(nbr->port_ident, port_ident_str) == 0) &&
-        (strcmp(nbr->sys_name, l_port->sys_name) == 0)) {
+    if (match_hostname == PTM_HOST_NAME_TYPE_HOSTNAME) {
+        event->rname = ptm_conf_prune_hostname(event->rname);
+    }
+
+    if (!existing) {
+        l_port = calloc(1, sizeof(*l_port));
+        if (!l_port) {
+            ERRLOG("Can't malloc memory for new LLDP port: %s\n",
+               port->port_name);
+            return;
+        }
+        copy_event_to_lport(event, l_port);
+        HASH_ADD(ph, lldp_port_hash, liface,
+                strlen(l_port->liface), l_port);
+    }
+
+    l_port->match_type = match_type;
+    l_port->match_hostname = match_hostname;
+
+    if (!strlen(port->nbr_sysname) ||
+        !strlen(port->nbr_ident)) {
+        /* if user never specified full nbr info in topo file
+         * we should ignore LLDP checks
+         * have seen one customer do this - when they dont
+         * care for LLDP but only want BFD configured on a port
+         */
+        DLOG("Port %s Ignore LLDP event - nbr not fully defined\n",
+             port->port_name);
+        return;
+    }
+
+    if (port_ident_str &&
+        (strcmp(port->nbr_ident, port_ident_str) == 0) &&
+        (strcmp(port->nbr_sysname, event->rname) == 0)) {
         if (port->topo_oper_state != PTM_TOPO_STATE_PASS) {
             port->topo_oper_state = PTM_TOPO_STATE_PASS;
             INFOLOG("Port %s correctly matched with remote %s.%s\n",
-                    port->port_name, l_port->sys_name, port_ident_str);
-            ptm_conf_topo_action(port, TRUE);
+                    port->port_name, event->rname, port_ident_str);
+            p_ctxt.port = port;
+            p_ctxt.set_env_var = 1;
+            ptm_conf_topo_action(&p_ctxt, TRUE);
         }
-    } else if (port->topo_oper_state != PTM_TOPO_STATE_FAIL) {
+        update = TRUE;
+    } else if (port->topo_oper_state == PTM_TOPO_STATE_NO_INFO) {
         port->topo_oper_state = PTM_TOPO_STATE_FAIL;
         INFOLOG("Port %s NOT matched with remote - "
                 "Expected [%s.%s] != [%s.%s]\n",
                 port->port_name,
-                nbr->sys_name, nbr->port_ident,
-                l_port->sys_name, port_ident_str);
-        ptm_conf_topo_action(port, FALSE);
+                port->nbr_sysname, port->nbr_ident,
+                event->rname,
+                port_ident_str?port_ident_str:"N/A");
+        p_ctxt.port = port;
+        p_ctxt.set_env_var = 1;
+        ptm_conf_topo_action(&p_ctxt, FALSE);
+        update = TRUE;
+    }
+
+    if (update) {
+        copy_event_to_lport(event, l_port);
     }
 }
 
 static void
-handle_lldp_event_del(ptm_event_t *event)
+handle_lldp_event_update(ptm_event_t *event)
 {
+    ptm_status_ctxt_t p_ctxt = {0};
     ptm_conf_port_t *port = NULL;
     lldp_port *l_port = NULL;
+    char *port_ident_str;
+    bool update = FALSE;
 
-    DLOG("LLDP Received DEL event for port %s\n", event->liface);
+    INFOLOG("Recd LLDP UPDATE event for port %s remote [%s - %s]\n",
+         event->liface, event->rname, event->riface);
 
     port = ptm_conf_get_port(event);
     if (!port) {
@@ -527,18 +912,100 @@ handle_lldp_event_del(ptm_event_t *event)
               strlen(port->port_name), l_port);
 
     if (!l_port) {
+        INFOLOG("Update event on non-existing LLDP port %s - Ignore\n",
+                event->liface);
+        return;
+    }
+
+    if (l_port->match_type == PORT_DESCRIPTION) {
+        port_ident_str = event->rdescr;
+    } else {
+        port_ident_str = event->riface;
+    }
+
+    if (l_port->match_hostname == PTM_HOST_NAME_TYPE_HOSTNAME) {
+        event->rname = ptm_conf_prune_hostname(event->rname);
+    }
+
+    if (!strlen(port->nbr_sysname) ||
+        !strlen(port->nbr_ident)) {
+        /* if user never specified full nbr info in topo file
+         * we should ignore LLDP checks
+         * have seen one customer do this - when they dont
+         * care for LLDP but only want BFD configured on a port
+         */
+        DLOG("Port %s Ignore LLDP event - nbr not fully defined\n",
+             port->port_name);
+        return;
+    }
+
+    if (port_ident_str &&
+        (strcmp(port->nbr_ident, port_ident_str) == 0) &&
+        (strcmp(port->nbr_sysname, event->rname) == 0)) {
+        if (port->topo_oper_state != PTM_TOPO_STATE_PASS) {
+            port->topo_oper_state = PTM_TOPO_STATE_PASS;
+            INFOLOG("Port %s correctly matched with remote %s.%s\n",
+                    port->port_name, event->rname, port_ident_str);
+            p_ctxt.port = port;
+            ptm_conf_topo_action(&p_ctxt, TRUE);
+        }
+        update = TRUE;
+    } else if (port->topo_oper_state == PTM_TOPO_STATE_PASS) {
+        port->topo_oper_state = PTM_TOPO_STATE_FAIL;
+        INFOLOG("Port %s NOT matched with remote - "
+            "Expected [%s.%s] != [%s.%s]\n",
+            port->port_name,
+            port->nbr_sysname, port->nbr_ident,
+            event->rname,
+            (port_ident_str)?port_ident_str:"N/A");
+        p_ctxt.port = port;
+        ptm_conf_topo_action(&p_ctxt, FALSE);
+        update = TRUE;
+    }
+
+    if (update) {
+        copy_event_to_lport(event, l_port);
+    }
+}
+
+static void
+handle_lldp_event_del(ptm_event_t *event)
+{
+    ptm_status_ctxt_t p_ctxt = {0};
+    ptm_conf_port_t *port = NULL;
+    lldp_port *l_port = NULL;
+
+    INFOLOG("Recd LLDP DEL event for port %s remote [%s - %s]\n",
+         event->liface, event->rname, event->riface);
+
+    HASH_FIND(ph, lldp_port_hash, event->liface,
+              strlen(event->liface), l_port);
+
+    if (!l_port) {
         DLOG("%s: LLDP nbr not found for port %s\n", __FUNCTION__,
              event->liface);
         return;
     }
 
-    if (port->topo_oper_state != PTM_TOPO_STATE_FAIL) {
-        port->topo_oper_state = PTM_TOPO_STATE_FAIL;
-        ptm_conf_topo_action(port, FALSE);
+    port = ptm_conf_get_port(event);
+    if (!port) {
+        DLOG("%s: Port %s not found \n", __FUNCTION__, event->liface);
+        return;
     }
-    port->topo_oper_state = PTM_TOPO_STATE_NO_INFO;
-    HASH_DELETE(ph, lldp_port_hash, l_port);
-    free(l_port);
+
+    if ((strcmp(l_port->port_name, event->riface) == 0) &&
+        (strcmp(l_port->sys_name, event->rname) == 0)) {
+        if (port->topo_oper_state != PTM_TOPO_STATE_FAIL) {
+            port->topo_oper_state = PTM_TOPO_STATE_FAIL;
+            INFOLOG("Port %s Removed by LLDP - remote %s.%s\n",
+                    port->port_name, l_port->sys_name, event->riface);
+            p_ctxt.port = port;
+            ptm_conf_topo_action(&p_ctxt, FALSE);
+        }
+        port->topo_oper_state = PTM_TOPO_STATE_NO_INFO;
+        HASH_DELETE(ph, lldp_port_hash, l_port);
+        free(l_port);
+    }
 }
 
 /**
@@ -549,8 +1016,10 @@ ptm_event_lldp(ptm_event_t *event)
 {
     switch (event->type) {
     case EVENT_ADD:
+        handle_lldp_event_add(event);
+        break;
     case EVENT_UPD:
-        handle_lldp_event_add_update(event);
+        handle_lldp_event_update(event);
         break;
     case EVENT_DEL:
         handle_lldp_event_del(event);
@@ -572,11 +1041,10 @@ ptm_process_lldp (int in_fd,
                   ptm_sockevent_e se,
                   void *udata)
 {
-    char buffer[512];
-    int rc;
+    char buffer[CTL_MSG_SZ];
+    int rc, num_msg;
 
-    if ((PTM_GET_STATE(ptm_lldp.gbl) == PTM_SHUTDOWN) ||
-        (PTM_GET_STATE(ptm_lldp.gbl) == PTM_RECONFIG)) {
+    if (PTM_GET_STATE(ptm_lldp.gbl) != PTM_RUNNING) {
         return (-1);
     }
 
@@ -586,30 +1054,42 @@ ptm_process_lldp (int in_fd,
 
     switch (se) {
     case SOCKEVENT_READ:
-        rc = ptm_lldp_recv_cb(ptm_lldp.conn, (const uint8_t *)buffer, 512, NULL);
-        if (rc <= 0) {
+        rc = ptm_lldp_recv_cb(ptm_lldp.conn, (const uint8_t *)buffer,
+                              sizeof(buffer), NULL);
+        if (rc < 0) {
+            sprintf(ptm_lldp.err_str, "ptm_lldp recv failure (rc=%d)", rc);
             ptm_shutdown_lldp();
             return (-1);
+        }
+
+        if (rc == 0) {
+            break;
         }
 
         /* This copies the data into the conn's internal buffer and processes
          * one message.
          */
         if (lldpctl_recv(ptm_lldp.conn, (const uint8_t *)buffer, rc) < 0) {
-            ERRLOG("rcv error (%s)\n", lldpctl_last_strerror(ptm_lldp.conn));
+            sprintf(ptm_lldp.err_str,
+                    "lldpctl_recv error - lldpctl[%s]",
+                    lldpctl_last_strerror(ptm_lldp.conn));
             ptm_shutdown_lldp();
             return (-1);
         }
 
-        /* process any additional data in buffer */
+        /* process any additional data in buffer (upto 5) */
+        num_msg = 0;
         do {
             rc = lldpctl_process_conn_buffer(ptm_lldp.conn);
-        } while (rc == 0);
+            num_msg++;
+        } while ((rc == 0) && (num_msg < 5));
         break;
 
     case SOCKEVENT_WRITE:
         if (lldpctl_send(ptm_lldp.conn) < 0) {
-            ERRLOG("send error (%s)\n", lldpctl_last_strerror(ptm_lldp.conn));
+            sprintf(ptm_lldp.err_str,
+                    "lldpctl_send error - lldpctl[%s]",
+                    lldpctl_last_strerror(ptm_lldp.conn));
             ptm_shutdown_lldp();
             return (-1);
         }
@@ -622,56 +1102,12 @@ ptm_process_lldp (int in_fd,
 }
 
 static void
-ptm_lldp_resync_timer(cl_timer_t *timer,
-                      void *context)
+ptm_lldp_free_non_existent_ports(void)
 {
-    int ret;
-
-    DLOG("%s: Begin Resync LLDP nbrs Cnt = %d\n", __FUNCTION__,
-         HASH_CNT(ph, lldp_port_hash));
-
-    ret = ptm_lldp_resync_nbrs();
-
-    if (ret) {
-        ERRLOG("%s: LLDPCTL resync failed - retry\n", __FUNCTION__);
-        ptm_shutdown_lldp();
-    }
-
-    DLOG("%s: End Resync LLDP nbrs Cnt = %d\n", __FUNCTION__,
-         HASH_CNT(ph, lldp_port_hash));
-
-    return;
-}
-
-static void ptm_stop_lldp_resync_timer(void)
-{
-    if (ptm_lldp.resync_timer) {
-        cl_timer_destroy(ptm_lldp.resync_timer);
-        ptm_lldp.resync_timer = NULL;
-    }
-}
-
-static void
-ptm_start_lldp_resync_timer(void)
-{
-    if (!ptm_lldp.resync_timer) {
-        ptm_lldp.resync_timer = cl_timer_create();
-        cl_timer_arm(ptm_lldp.resync_timer, ptm_lldp_resync_timer,
-                     LLDPD_PERIODIC_RESYNC_INTERVAL, T_UF_PERIOIDIC);
-    }
-}
-
-static int ptm_lldp_resync_nbrs(void)
-{
+    int old;
+    ptm_status_ctxt_t p_ctxt = {0};
     struct ptm_conf_port *port, tmp_port;
     lldp_port *l_port, *tmp;
-    int ret, old;
-
-    ret = get_lldp_neighbor_list(ptm_lldp.conn);
-
-    if (ret) {
-        return ret;
-    }
 
     /* remove non-existing ports */
     old = HASH_CNT(ph, lldp_port_hash);
@@ -681,18 +1117,19 @@ static int ptm_lldp_resync_nbrs(void)
             /* only inform clients */
             strcpy(tmp_port.port_name, l_port->liface);
             tmp_port.topo_oper_state = PTM_TOPO_STATE_FAIL;
-            ptm_conf_topo_action (&tmp_port, FALSE);
+            INFOLOG("LLDP Port %s not existing - topo-action\n",
+                    tmp_port.port_name);
+            p_ctxt.port = &tmp_port;
+            ptm_conf_topo_action (&p_ctxt, FALSE);
             HASH_DELETE(ph, lldp_port_hash, l_port);
             free(l_port);
         }
     }
 
     if (old - HASH_CNT(ph, lldp_port_hash)) {
-        DLOG("%s: Deleted non-existent ports %d\n", __FUNCTION__,
-             old - HASH_CNT(ph, lldp_port_hash));
+        INFOLOG("%s: Deleted non-existent ports %d\n", __FUNCTION__,
+                old - HASH_CNT(ph, lldp_port_hash));
     }
-
-    return ret;
 }
 
 static int
@@ -705,24 +1142,36 @@ ptm_populate_lldp ()
     if (ptm_lldp.conn == NULL)
         return (-1);
 
-    ptm_start_lldp_resync_timer();
+    /* request a resync */
+    ptm_lldp.resync = TRUE;
 
-    ret = ptm_lldp_resync_nbrs();
+    ptm_lldp.in_cache_loop = 1;
+
+    ret = ptm_lldp_sync_nbrs();
+
+    ptm_lldp.in_cache_loop = 0;
 
     if (ret) {
-        ERRLOG("%s: LLDPCTL resync failed \n", __FUNCTION__);
+        sprintf(ptm_lldp.err_str, "%s: LLDPCTL sync failed - retry",
+            __FUNCTION__);
         ptm_shutdown_lldp();
         return ret;
     }
 
     /*
      * start watching for neighbor events.
+     * We make sure a dummy parm is passed - to differentiate
+     * between lldpctl notification and internal call
+     * parm=1, lldpctl notification
+     * parm=0, ptm internal call
      */
-    ret = lldpctl_watch_callback(ptm_lldp.conn, watch_lldp_neighbors_cb, NULL);
+    ret = lldpctl_watch_callback(ptm_lldp.conn,
+                process_lldp_neighbors_cb, (void *)1);
 
     if (ret) {
-        ERRLOG("%s: LLDPCTL callback registration failed (%s)\n",
-               __FUNCTION__, lldpctl_last_strerror(ptm_lldp.conn));
+        sprintf(ptm_lldp.err_str,
+                "lldpctl_watch_callback failed - lldpctl[%s]",
+                lldpctl_last_strerror(ptm_lldp.conn));
         ptm_shutdown_lldp();
     } else {
         PTM_MODULE_SET_STATE(ptm_lldp.gbl, LLDP_MODULE, MOD_STATE_POPULATE);
@@ -742,8 +1191,6 @@ ptm_init_lldp (ptm_globals_t *g)
     int ret = 0;
     const char *name;
     struct sockaddr_un su;
-    char old_hostname[HOST_NAME_MAX+1] = {0};
-    char old_mgmtip[INET6_ADDRSTRLEN+1] = {0};
 
     ptm_lldp.gbl = g;
 
@@ -754,29 +1201,31 @@ ptm_init_lldp (ptm_globals_t *g)
     PTM_MODULE_PROCESSCB(g, LLDP_MODULE) = ptm_process_lldp;
     PTM_MODULE_PARSECB(g, LLDP_MODULE) = ptm_parse_lldp;
     PTM_MODULE_STATUSCB(g, LLDP_MODULE) = ptm_status_lldp;
-    PTM_MODULE_DEBUGCB(g, LLDP_MODULE) = ptm_debug_lldp;
 
     /* init global default */
     ptm_lldp.parms.match_type = PORTID_IFNAME;
+    ptm_lldp.parms.match_hostname = PTM_HOST_NAME_TYPE_HOSTNAME;
 
     /* init lldpctl connectivity */
     name = lldpctl_get_default_transport();
     flags = SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK;
     if ((s = socket(PF_UNIX, flags, 0)) == -1) {
-        ERRLOG("Create socket failed (%s)\n", strerror(errno));
+        sprintf(ptm_lldp.err_str,
+                "Create socket failed (%s)", strerror(errno));
         ptm_shutdown_lldp();
         return (-1);
     }
 
-    PTM_MODULE_SET_FD(ptm_lldp.gbl, s, LLDP_MODULE);
+    PTM_MODULE_SET_FD(ptm_lldp.gbl, s, LLDP_MODULE, 0);
 
     su.sun_family = AF_UNIX;
     memset(su.sun_path, 0, sizeof(su.sun_path));
     strncpy(su.sun_path, name, sizeof(su.sun_path));
     if (connect(s, (struct sockaddr *)&su, sizeof(struct sockaddr_un)) == -1) {
-        if ((ptm_lldp.mod_retry_cnt < MOD_RETRY_DISPLAY_INTERVAL) ||
-            (ptm_lldp.mod_retry_cnt % MOD_RETRY_DISPLAY_INTERVAL)) {
-            ERRLOG("%s: socket connect failed (%s) retry [%d]\n",
+        ptm_lldp.err_str[0] = '\0';
+        if (ptm_lldp.mod_retry_cnt < MOD_LLDP_RETRY_COUNT) {
+            sprintf(ptm_lldp.err_str,
+                    "%s: socket connect failed (%s) retry [%d]",
                    __FUNCTION__, strerror(errno), ptm_lldp.mod_retry_cnt);
         }
         ptm_shutdown_lldp();
@@ -786,41 +1235,24 @@ ptm_init_lldp (ptm_globals_t *g)
     /* create the client connection structure */
     ptm_lldp.conn = lldpctl_new(ptm_lldp_send_cb, ptm_lldp_recv_cb, NULL);
     if (ptm_lldp.conn == NULL) {
-        ERRLOG("Failed to get LLDPCTL connection\n");
+        sprintf(ptm_lldp.err_str, "Failed to get LLDPCTL connection");
         ptm_shutdown_lldp();
         return (-1);
     }
+
+    INFOLOG("Successfully connected to LLDP socket\n");
 
     /*
      * get local system information from LLDPD. This creates the socket
      * and connects to LLDPD if necessary.
      */
-    if (ptm_lldp.gbl->my_hostname)
-        snprintf(old_hostname, HOST_NAME_MAX+1, "%s", ptm_lldp.gbl->my_hostname);
-
-    if (ptm_lldp.gbl->my_mgmtip)
-        snprintf(old_mgmtip, INET6_ADDRSTRLEN+1, "%s", ptm_lldp.gbl->my_mgmtip);
-
     ret = get_local_params(ptm_lldp.conn);
 
     if (ret) {
-        ERRLOG("Failed to get LLDPCTL connection\n");
+        sprintf(ptm_lldp.err_str,
+            "Failed to get local host info from LLDP");
         ptm_shutdown_lldp();
         return (-1);
-    }
-
-    if (ptm_lldp.gbl->my_hostname) {
-        if (strcmp(old_hostname, ptm_lldp.gbl->my_hostname))
-            ptm_lldp.gbl->hostname_changed = true;
-    } else if (strlen(old_hostname)) {
-        ptm_lldp.gbl->hostname_changed = true;
-    }
-
-    if (ptm_lldp.gbl->my_mgmtip) {
-        if (strcmp(old_mgmtip, ptm_lldp.gbl->my_mgmtip))
-            ptm_lldp.gbl->mgmt_ip_changed = true;
-    } else if (strlen(old_mgmtip)) {
-        ptm_lldp.gbl->mgmt_ip_changed = true;
     }
 
     ptm_lldp.mod_retry_cnt = 0;
@@ -836,6 +1268,22 @@ static int lldp_parse_match_type(lldp_parms_t *parms, char *val)
         if (!strcasecmp(val, type_list[i].str)) {
             DLOG("%s: Found supported value [%s] \n", __FUNCTION__, val);
             parms->match_type = type_list[i].type;
+            /* we are done */
+            return 0;
+        }
+        i++;
+    }
+    DLOG("%s: Unsupported value [%s] \n", __FUNCTION__, val);
+    return -1;
+}
+
+static int lldp_parse_match_hostname(lldp_parms_t *parms, char *val)
+{
+    int i = 0;
+    while (hostname_list[i].str) {
+        if (!strcasecmp(val, hostname_list[i].str)) {
+            DLOG("%s: Found supported value [%s] \n", __FUNCTION__, val);
+            parms->match_hostname = hostname_list[i].type;
             /* we are done */
             return 0;
         }
@@ -865,20 +1313,20 @@ static int ptm_parse_lldp(struct ptm_conf_port *port, char *args)
     char val[MAX_ARGLEN], tmpl_str[MAX_ARGLEN];
     int rval, i, change = 0;
 
-    DLOG("lldp %s args %s\n", port->port_name,
-         (args && strlen(args))?args:"None");
+    INFOLOG("lldp %s args %s\n", port->port_name,
+            (args && strlen(args))?args:"None");
 
     HASH_FIND(ph, lldp_parms_hash, port->port_name,
               strlen(port->port_name), curr);
 
-    if (!args || !strlen(args)) {
-        /* no args supplied - delete port param */
-        if (curr) {
-            HASH_DELETE(ph, lldp_parms_hash, curr);
-            free(curr);
-        }
-        return 0;
+    if (curr) {
+        HASH_DELETE(ph, lldp_parms_hash, curr);
+        free(curr);
+        curr = NULL;
     }
+
+    if (!args)
+        return -1;
 
     assert(strlen(args) <= MAX_ARGLEN);
     strcpy(in_args, args);
@@ -887,7 +1335,7 @@ static int ptm_parse_lldp(struct ptm_conf_port *port, char *args)
     ptm_parse_lldp_template(in_args, tmpl_str);
 
     if (strlen(tmpl_str)) {
-        DLOG("%s: Allow template [%s]\n", __FUNCTION__, tmpl_str);
+        INFOLOG("%s: Allow template [%s]\n", __FUNCTION__, tmpl_str);
         strcpy(in_args, tmpl_str);
     }
 
@@ -902,6 +1350,7 @@ static int ptm_parse_lldp(struct ptm_conf_port *port, char *args)
             sizeof(entry->port_name));
     /* Initialize port defaults with global defaults */
     entry->parms.match_type = ptm_lldp.parms.match_type;
+    entry->parms.match_hostname = ptm_lldp.parms.match_hostname;
 
     /* check for valid params */
     for(i = 0; lldp_parms_key[i].key; i++) {
@@ -970,13 +1419,20 @@ ptm_lldp_time_str(char *tstr, time_t t)
     strcat(tstr, tmpbuf);
 }
 
+#define UPDATE_ENV_VAR(s, v) {  \
+            if (strlen(v)) setenv(s, v, 1); \
+            else setenv(s, "N/A", 1); \
+        }
+
 static int
-ptm_status_lldp(csv_t *csv, csv_record_t **hrec, csv_record_t **drec,
-                char *opt, void *arg)
+ptm_status_lldp(void *m_ctxt, void *in_ctxt, void *out_ctxt)
 {
-    struct ptm_conf_port *port = arg;
-    struct ptm_conf_nbr *nbr = &port->admin;
+    char val[MAXNAMELEN+1], modstr[MAXNAMELEN+1];
+    ptm_status_ctxt_t *p_ctxt;
+    struct ptm_conf_port *port = NULL;
     lldp_port *l_port = NULL;
+    char liface[MAXNAMELEN+1];
+    char oper_state[MAXNAMELEN+1];
     char abuf[2*(MAXNAMELEN+1)];
     char ebuf[2*(MAXNAMELEN+1)];
     char tbuf[32];
@@ -986,129 +1442,119 @@ ptm_status_lldp(csv_t *csv, csv_record_t **hrec, csv_record_t **drec,
     char portdescr[MAXNAMELEN+1];
     char *port_ident_str = NULL;
     int detail = FALSE;
-    char *dtlstr;
+    int set_env = FALSE;
 
-    /* get status cmd has only one option at this point */
-    dtlstr = strtok_r(NULL, " ", &opt);
+    /* figure out the params */
+    if (!ptm_lib_find_key_in_msg(in_ctxt, "module", modstr)) {
+        if (!strcasecmp(modstr, ptm_module_string(LLDP_MODULE))) {
+            l_port = m_ctxt;
+            port = ptm_conf_get_port_by_name(l_port->liface);
+        } else if (!strcasecmp(modstr, ptm_module_string(CONF_MODULE))) {
+            p_ctxt = m_ctxt;
+            port = p_ctxt->port;
+            set_env = p_ctxt->set_env_var;
+            HASH_FIND(ph, lldp_port_hash, port->port_name,
+                  strlen(port->port_name), l_port);
+        } else {
+            /* not the relevant module */
+            return PTM_CMD_OK;
+        }
+    } else {
+        /* no module specified - assume default */
+        p_ctxt = m_ctxt;
+        port = p_ctxt->port;
+        set_env = p_ctxt->set_env_var;
+        HASH_FIND(ph, lldp_port_hash, port->port_name,
+                  strlen(port->port_name), l_port);
+    }
 
-    if(dtlstr && !strcmp(dtlstr, "detail"))
+    if (!ptm_lib_find_key_in_msg(in_ctxt, "detail", val) &&
+        !strcasecmp(val, "yes"))
         detail = TRUE;
 
-    HASH_FIND(ph, lldp_port_hash, port->port_name,
-              strlen(port->port_name), l_port);
-
+    /* initialize the defaults */
+    strcpy(liface, "N/A");
+    sprintf(oper_state, "N/A");
     if (l_port) {
         if (l_port->match_type == PORT_DESCRIPTION)
             port_ident_str = l_port->port_descr;
         else
             port_ident_str = l_port->port_name;
-    }
-
-    /* first the header */
-    if (detail)
-        *hrec = csv_encode(csv, 9, "port", "cbl status", "exp nbr",
-                "act nbr", "sysname", "portID", "portDescr",
-                "match on", "last upd");
-    else
-        *hrec = csv_encode(csv, 2, "port", "cbl status");
-
-    if (!*hrec) {
-        ERRLOG("%s: Could not allocate csv hdr record\n", __FUNCTION__);
-        return (PTM_CMD_ERROR);
-    }
-
-    if (detail) {
-        sprintf(ebuf, "%s:%s", nbr->sys_name, nbr->port_ident);
-        ptm_lldp_time_str(tbuf, (l_port)?l_port->last_change_time:0);
-
-        sprintf(matchon, "N/A");
-        sprintf(sysname, "N/A");
-        sprintf(portname, "N/A");
-        sprintf(portdescr, "N/A");
-        sprintf(abuf, "no-info");
-        if (l_port) {
-            if (port->topo_oper_state != PTM_TOPO_STATE_NO_INFO)
-                sprintf(abuf, "%s:%s", l_port->sys_name, port_ident_str);
-            if (l_port->match_type == PORT_DESCRIPTION) {
-                sprintf(matchon, "PortDescr");
-            } else {
-                sprintf(matchon, "IfName");
-            }
-            sprintf(sysname, "%s", l_port->sys_name);
-            sprintf(portname, "%s", l_port->port_name);
-            sprintf(portdescr, "%s", l_port->port_descr);
+        strcpy(liface, l_port->liface);
+        if (port) {
+            if (port->topo_oper_state == PTM_TOPO_STATE_PASS)
+                sprintf(oper_state, "pass");
+            else if (port->topo_oper_state == PTM_TOPO_STATE_FAIL)
+                sprintf(oper_state, "fail");
         }
+    } else if (port) {
+        strcpy(liface, port->port_name);
     }
 
-    /* now the data */
-    if (detail)
-        *drec = csv_encode(csv, 9, port->port_name,
-                ((port->topo_oper_state == PTM_TOPO_STATE_PASS)?
-                 "pass" : "fail"),
-                ebuf, abuf, sysname, portname, portdescr, matchon, tbuf);
-    else
-        *drec = csv_encode(csv, 2, port->port_name,
-                ((port->topo_oper_state == PTM_TOPO_STATE_PASS)?
-                 "pass" : "fail"));
-
-    if (!*drec) {
-        ERRLOG("%s: Could not allocate csv data record\n", __FUNCTION__);
-        return (PTM_CMD_ERROR);
-    }
-
-    return (PTM_CMD_OK);
-}
-
-static int
-ptm_debug_lldp(csv_t *csv, csv_record_t **hr, csv_record_t **dr,
-               char *opt, void *arg, char *err_str)
-{
-    lldp_port *l_port, *tmp;
-    csv_record_t *hrec, *drec;
-    char tbuf[32];
-    char tmpbuf[32];
-
-    if (!HASH_CNT(ph, lldp_port_hash)) {
-        if (err_str)
-            sprintf(err_str,
-                    "No LLDP ports detected. Check connections");
-
-        ERRLOG("%s: No LLDP ports detected. Check connections\n",
-               __FUNCTION__);
-        return (PTM_CMD_ERROR);
-    }
-
-    if (err_str)
-        sprintf(err_str, "LLDP internal error");
-
-    /* first the header */
-    hrec = csv_encode(csv, 6, "port", "sysname", "portID",
-                      "port descr","match on", "last upd");
-
-    if (!hrec) {
-        ERRLOG("%s: Could not allocate csv hdr record\n", __FUNCTION__);
-        return (PTM_CMD_ERROR);
-    }
-
-    HASH_ITER(ph, lldp_port_hash, l_port, tmp) {
-
+    sprintf(ebuf, "no-info:no-info");
+    sprintf(matchon, "N/A");
+    sprintf(sysname, "N/A");
+    sprintf(portname, "N/A");
+    sprintf(portdescr, "N/A");
+    sprintf(abuf, "no-info");
+    sprintf(tbuf, "N/A");
+    if (port)
+        sprintf(ebuf, "%s:%s", port->nbr_sysname, port->nbr_ident);
+    if (l_port) {
         ptm_lldp_time_str(tbuf, l_port->last_change_time);
-
+        if (port && (port->topo_oper_state != PTM_TOPO_STATE_NO_INFO))
+            sprintf(abuf, "%s:%s", l_port->sys_name, port_ident_str);
         if (l_port->match_type == PORT_DESCRIPTION) {
-            sprintf(tmpbuf, "PortDescr");
+            sprintf(matchon, "PortDescr");
         } else {
-            sprintf(tmpbuf, "IfName");
+            sprintf(matchon, "IfName");
         }
+        sprintf(sysname, "%s", l_port->sys_name);
+        sprintf(portname, "%s", l_port->port_name);
+        sprintf(portdescr, "%s", l_port->port_descr);
+    }
 
-        /* now the data */
-        drec = csv_encode(csv, 6, l_port->liface, l_port->sys_name,
-                          l_port->port_name, l_port->port_descr, tmpbuf, tbuf);
-        if (!drec) {
-            ERRLOG("%s: Could not allocate csv data record\n", __FUNCTION__);
-            return (PTM_CMD_ERROR);
-        }
+    /* start adding data */
+    ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt, "port", liface);
+    ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt, "cbl status",
+                       oper_state);
+    if (detail) {
+        ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt,
+                           "exp nbr", ebuf);
+        ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt,
+                           "act nbr", abuf);
+        ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt,
+                           "sysname", sysname);
+        ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt,
+                           "portID", portname);
+        ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt,
+                           "portDescr", portdescr);
+        ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt,
+                           "match on", matchon);
+        ptm_lib_append_msg(ptm_lldp.gbl->ptmlib_hdl, out_ctxt,
+                           "last upd", tbuf);
+    }
 
+    if (set_env) {
+        UPDATE_ENV_VAR(PTM_ENV_VAR_PORT, liface);
+        UPDATE_ENV_VAR(PTM_ENV_VAR_CBLSTATUS, oper_state);
+        UPDATE_ENV_VAR(PTM_ENV_VAR_EXPNBR, ebuf);
+        UPDATE_ENV_VAR(PTM_ENV_VAR_ACTNBR, abuf);
     }
 
     return (PTM_CMD_OK);
 }
+
+void *ptm_lldp_get_next_sess_iter(void *ptr)
+{
+    lldp_port *l_port = ptr;
+
+    return ((!l_port)?lldp_port_hash:l_port->ph.next);
+}
+
+#ifdef LLDPCTL_DEBUG
+void ptm_lldpctl_log(int severity, const char *msg)
+{
+    INFOLOG("lldpctl: %s\n", msg);
+}
+#endif
