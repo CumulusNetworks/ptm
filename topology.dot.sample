@@ -1,0 +1,40 @@
+####################################################
+#
+# This is a sample topology.dot file that shows
+# the different configuration parameters at work
+# Copy to /etc/ptm.d location, remove
+# the ".sample" extension and restart ptmd for it
+# to take effect
+#
+# BFD Parameters
+# ---------------
+# upMinTx       = default 300, expressed in ms
+# requiredMinRx = default 300, expressed in ms
+# detectMult    = default 3
+# bfdtmpl       = [user defined string]
+#
+# LLDP Parameters
+# ---------------
+# match_type    = "portdescr", "ifname"
+# lldptmpl      = [user defined string]
+#
+####################################################
+
+graph G {
+## global param definitions - default values
+    LLDP=""
+    BFD=""
+## template definitions
+    B1="upMinTx=250, detectMult=4"
+    B2="upMinTx=350, detectMult=3"
+    L1="match_type=portdescr"
+    L2="match_type=ifname"
+## this node uses global param
+    "switch1":"swp1" -- "switch2":"swp41"
+## this node uses per-port settings
+    "switch1":"swp2" -- "switch2":"swp42" [LLDP="match_type=portdescr", BFD="upMinTx=400"]
+## this node uses templates L1 and B1
+    "switch1":"swp3" -- "switch2":"swp43" [LLDP="lldptmpl=L1", BFD="bfdtmpl=B1"]
+## this node uses templates L2 and B2
+    "switch1":"swp4" -- "switch2":"swp44" [LLDP="lldptmpl=L2", BFD="bfdtmpl=B2"]
+}
