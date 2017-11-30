@@ -1,0 +1,58 @@
+#! /bin/bash
+# Copyright 2017, Cumulus Networks, Inc.  All rights reserved.
+#
+# Record ptm state; used by cl-support
+#
+#TIMEOUT=60
+#DEFAULT
+#ONCORE=ptmd
+
+module=${0##*/}
+
+funcs=(ptm)
+json=
+
+func_ptm()
+{
+    exec_cmd $json ptmctl.detail ptmctl -d $json
+    exec_cmd $json ptmctl.bfd ptmctl -b -d $json
+}
+
+while getopts "c:jl" Option; do
+    case $Option in
+    c) [ $SUP_VERBOSE -eq 1 ] && # default submods
+        echo ${module}: Invoked for "$OPTARG" core dumps 1>&2 ;;
+    j) json=-j ;;
+    l) echo ${funcs[@]}
+       exit 0 ;;
+    *) ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+main()
+{
+    local -r TIMEFORMAT='%2R seconds' tfile=/run/${module}_funcstime$$
+    local secs
+    if [ $# -ne 0 ]; then # only run specified sub-modules
+       [ $SUP_VERBOSE -eq 1 ] && echo ${module}: run only submodules: $@ 1>&$stderr
+       funcs=($@)
+    fi
+
+    for func in ${funcs[@]}; do
+        [ $SUP_VERBOSE -eq 1 ] && echo "$module.$func" 1>&2
+        date +"### $module.$func Started at %F-%T"
+        { time func_$func 2>&$stderr  ; } 2>$tfile
+        read secs < $tfile
+        echo "### $module.$func Completed in $secs"
+    done
+    rm $tfile
+}
+
+TIMEFORMAT="Module $module Completed in %2R seconds"
+exec 42>&2
+stderr=42
+
+{ time main $@ 2>&$stderr ; } 2>&1
+
+exit 0

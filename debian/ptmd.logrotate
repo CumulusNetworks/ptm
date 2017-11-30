@@ -1,0 +1,15 @@
+# Copyright 2017, Cumulus Networks, Inc.  All rights reserved.
+/var/log/ptmd.log {
+        size 500k
+        sharedscripts
+        missingok
+        compress
+        rotate 14
+        nocreate
+        delaycompress
+        include /etc/logrotate.d/cumulus.savefast
+
+        postrotate
+                invoke-rc.d rsyslog rotate > /dev/null
+        endscript
+}

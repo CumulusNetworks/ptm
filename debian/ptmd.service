@@ -1,0 +1,18 @@
+[Unit]
+Description=Prescriptive Topology Manager (PTM) Daemon.
+Documentation=man:ptmd(8) man:ptmctl(8)
+After=network-online.target networking.service syslog.service
+OnFailure=heartbeat-failed@%n.service
+
+[Service]
+Type=simple
+Environment='DAEMON_LOG_LEVEL=-l INFO'
+ExecStart=/usr/sbin/ptmd $DAEMON_LOG_LEVEL $DAEMON_OPT_ARGS
+ExecReload=/bin/kill -USR1 $MAINPID
+Restart=always
+StartLimitInterval=60
+StartLimitBurst=3
+TimeoutStartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+Source: ptm
+Section: net
+Priority: extra
+Maintainer: dev-support <dev-support@cumulusnetworks.com>
+Build-Depends: debhelper (>= 8.0.0), liblldpctl-dev, libgraphviz-dev, dh-autoreconf, dh-systemd
+Standards-Version: 3.9.3
+XS-Python-Version: All
+Homepage: 
+#Vcs-Git: git://git.debian.org/collab-maint/ptm.git
+#Vcs-Browser: http://git.debian.org/?p=collab-maint/ptm.git;a=summary
+
+Package: ptmd
+Architecture: any
+Depends: libcgraph6, lldpd, ${shlibs:Depends}, ${misc:Depends}
+Description: Prescriptive Topology Manager Daemon
+ This daemon verifies that the node it runs on is connected correctly
+ to its neighbors. Using a network graph specification in Graphviz's
+ DOT language, this ptmd determines the expected connectivity of the
+ node it is running on, verifies the expected connectivity with the
+ actual connectivity using lldpd and notifies the relevant clients of
+ the pass/fail status of the connectivity check for each port.
+ The daemon also supports Bi-directional forwarding detection for
+ singlehop and multihop sessions. BFD sessions can be started via
+ topology file and client API.
+
+Package: libptm-dev
+Section: libdevel
+Architecture: any
+Depends: ${misc:Depends}
+Description: Prespective Topology Manager library - development files
+ This package contains APIs needed by clients to interfaces with ptmd.

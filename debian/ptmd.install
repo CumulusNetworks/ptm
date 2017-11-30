@@ -1,0 +1,10 @@
+src/ptmd                	usr/sbin
+src/ptmctl              	usr/bin
+if-topo-pass                etc/ptm.d
+if-topo-fail                etc/ptm.d
+topology.dot.sample         usr/share/doc/ptmd/examples
+bfd-sess-up                 etc/ptm.d
+bfd-sess-down               etc/ptm.d
+etc/rsyslog.d/30-ptmd.conf	etc/rsyslog.d/
+etc/systemd/system/ptmd.service.d/ptmd.conf  etc/systemd/system/ptmd.service.d/
+debian/support/* usr/share/cumulus/support
