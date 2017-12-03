@@ -20,31 +20,6 @@ set -e
 
 case "$1" in
     configure)
-    if [ -d /etc/cumulus/ptm.d ] && [ ! -L /etc/cumulus/ptm.d ]; then
-        if [ ! -d /etc/ptm.d ]; then
-            mkdir /etc/ptm.d
-        fi
-
-        echo "Backing up files in /etc/cumulus/ptm.d"
-        for f in /etc/cumulus/ptm.d/*; do
-        if [ -f $f ]; then
-            bn="${f##*/}"
-            if [ "$bn" != "topology.dot" ]; then
-	            cp -a $f /etc/ptm.d/$bn.dpkg-old
-            else
-	            cp -a $f /etc/ptm.d/$bn
-            fi
-        fi
-        done
-        rm -rf /etc/cumulus/ptm.d
-        ln -s /etc/ptm.d /etc/cumulus/ptm.d
-    fi
-
-    # Remove leftover sysvinit scripts when we detect the init environment
-    # is systemd
-    if [ -d /run/systemd/system -a -e /etc/init.d/ptmd ]; then
-        rm -f /etc/init.d/ptmd
-    fi
     ;;
 
     abort-upgrade)

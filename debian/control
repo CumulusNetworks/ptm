@@ -1,13 +1,13 @@
 Source: ptm
 Section: net
 Priority: extra
-Maintainer: dev-support <dev-support@cumulusnetworks.com>
+Maintainer: support <support@cumulusnetworks.com>
 Build-Depends: debhelper (>= 8.0.0), liblldpctl-dev, libgraphviz-dev, dh-autoreconf, dh-systemd
-Standards-Version: 3.9.3
+Standards-Version: 3.6
 XS-Python-Version: All
 Homepage: 
-#Vcs-Git: git://git.debian.org/collab-maint/ptm.git
-#Vcs-Browser: http://git.debian.org/?p=collab-maint/ptm.git;a=summary
+#Vcs-Git: git://github.com:CumulusNetworks/ptm.git
+#Vcs-Browser: https://github.comg/CumulusNetworks/ptm.git
 
 Package: ptmd
 Architecture: any
