@@ -72,4 +72,4 @@ AC_CHECK_LIB(cgraph,agfstout)
 AC_CHECK_LIB(lldpctl, lldpctl_atom_dec_ref)
 AC_CHECK_LIB(lldpctl, lldpctl_process_conn_buffer, [], AC_MSG_ERROR([Need LLDPD > 0.7.10]))
 
-AC_OUTPUT(Makefile lib/log/Makefile lib/ptmlib/Makefile lib/ptmlib/libptm.pc src/Makefile)
+AC_OUTPUT(Makefile lib/ptmlib/Makefile lib/ptmlib/libptm.pc src/Makefile)

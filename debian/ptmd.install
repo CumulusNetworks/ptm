@@ -7,4 +7,3 @@ bfd-sess-up                 etc/ptm.d
 bfd-sess-down               etc/ptm.d
 etc/rsyslog.d/30-ptmd.conf	etc/rsyslog.d/
 etc/systemd/system/ptmd.service.d/ptmd.conf  etc/systemd/system/ptmd.service.d/
-debian/support/* usr/share/cumulus/support

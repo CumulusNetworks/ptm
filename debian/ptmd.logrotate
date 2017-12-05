@@ -7,7 +7,6 @@
         rotate 14
         nocreate
         delaycompress
-        include /etc/logrotate.d/cumulus.savefast
 
         postrotate
                 invoke-rc.d rsyslog rotate > /dev/null

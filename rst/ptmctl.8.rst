@@ -7,8 +7,8 @@ Retrieve Operational State of ptmd Daemon
 -----------------------------------------
 
 :Author: Cumulus Networks, Inc
-:Date:   2016-04-01
-:Copyright: Copyright 2014 Cumulus Networks, Inc.  All rights reserved.
+:Date:   2017-12-05
+:Copyright: Copyright 2014,2015,2016,2017 Cumulus Networks, Inc.  All rights reserved.
 :Version: 3.0
 :Manual section: 8
 

@@ -5,10 +5,8 @@
 # may obtain a copy of the License at
 # http://www.opensource.org/licenses/eclipse-1.0.php
 
-AM_CPPFLAGS = -I../log
-
 lib_LTLIBRARIES = libptm.la
-include_HEADERS = csv.h ptm_lib.h
+include_HEADERS = csv.h ptm_lib.h log.h
 
 libptm_la_SOURCES = csv.c ptm_lib.c
 

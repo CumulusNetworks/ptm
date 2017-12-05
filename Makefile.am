@@ -8,4 +8,4 @@
 AM_CFLAGS = -Wno-enum-compare -Wno-unused-result -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$(PTMD_VERSION)\"
 ACLOCAL_AMFLAGS = -I m4
 
-SUBDIRS = lib/log lib/ptmlib src
+SUBDIRS = lib/ptmlib src

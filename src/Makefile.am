@@ -7,13 +7,13 @@
 
 PTMD_VERSION=3.0
 AM_CFLAGS = -Wno-enum-compare -Wno-unused-result -std=gnu99 -Wall -Werror -g -O0 -DPTMD_VERSION=\"$(PTMD_VERSION)\"
-AM_CPPFLAGS = -I../lib/ -I../lib/ptmlib -I../lib/log -Ihash -Igraph
-AM_LDFLAGS = -L../lib/ptmlib -L../lib/log -L/usr/lib -llldpctl -lcgraph -lrt
+AM_CPPFLAGS = -I../lib/ -I../lib/ptmlib -Ihash -Igraph
+AM_LDFLAGS = -L../lib/ptmlib -L/usr/lib -llldpctl -lcgraph -lrt
 
 sbin_PROGRAMS = ptmd
 sbin_SCRIPTS  = ptmctl
 
-ptmd_LDADD = ../lib/ptmlib/.libs/libptm.a ../lib/log/libptmlogdep.a
+ptmd_LDADD = ../lib/ptmlib/.libs/libptm.a
 ptmd_SOURCES = ptm_lldp.c ptm_ctl.c ptm_event.c ptm_conf.c ptm_timer.c ptm_bfd.c ptm_nbr.c ptm_quagga.c ptm_ipaddr.c ptm_util.c ptm_netlink.c
 noinst_HEADERS = \
 	ptm_conf.h ptm_lldp.h ptm_event.h ptm_ctl.h ptm_timer.h ptm_bfd.h ptm_nbr.h ptm_quagga.h ptm_quagga_if.h ptm_ipaddr.h ptm_util.h ptm_netlink.h graph/cdt.h graph/cgraph.h

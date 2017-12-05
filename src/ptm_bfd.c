@@ -980,7 +980,7 @@ ptm_process_bfd_pkt(int s, ptm_sockevent_e se, void *udata)
     }
 
     if (cp->detect_mult == 0) {
-        INFOLOG("Detect Mult is zero in pkt from %s\n", peer_addr)
+        INFOLOG("Detect Mult is zero in pkt from %s\n", peer_addr);
         return -1;
     }
 
@@ -1354,14 +1354,15 @@ ptm_bfd_sess_find(bfd_pkt_t *cp,
                 return(l_bfd);
             }
         }
-        if (is_mhop)
+        if (is_mhop) {
            DLOG("Can't find multi hop session peer/local %s/%s in vrf %s port %s\n",
                 peer_addr, local_addr,
                 strlen(mhop.vrf_name)? mhop.vrf_name:"N/A",
                 port_name?port_name:"N/A");
-        else
+        } else {
            DLOG("Can't find single hop session for peer/port %s/%s\n",
                             peer_addr, port_name);
+        }
     } else if (peer.ip4_addr.s_addr ||
                !IN6_IS_ADDR_UNSPECIFIED(&peer.ip6_addr)) {
 

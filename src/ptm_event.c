@@ -30,6 +30,7 @@
 #include "ptm_lib.h"
 
 static FILE *pid_fp;
+int g_log_level;
 
 /* fast retry interval expressed in NS */
 #define FAST_INIT_RETRY_INTERVAL (500 * NSEC_PER_MSEC)
@@ -533,8 +534,6 @@ main (int argc, char *argv[])
     int m, my_pid;
     bool daemonize = FALSE;
     char loglevel[16] = "INFO";
-    char tmplogstr[sizeof "syslog="+sizeof(loglevel)+8];
-    const char *logstr[2];
     unsigned int retry_mods;
 
     sprintf(file, "%s/%s", PTM_CONF_DIR, PTM_CONF_FILE);
@@ -574,13 +573,18 @@ main (int argc, char *argv[])
         }
     }
 
-    snprintf(tmplogstr, sizeof tmplogstr, "syslog=%s", loglevel);
-    logstr[0] = strdupa(tmplogstr);
-    ret = log_init(logstr, 1);
-    if (!ret) {
-        fprintf(stderr, "Log init failed (%s), exiting.\n", tmplogstr);
-        exit(11);
+    if (!strncmp(loglevel, "WARN", sizeof(loglevel-1))) {
+        g_log_level = LOG_WARNING;
+    } else if (!strncmp(loglevel, "CRIT", sizeof(loglevel-1))) {
+        g_log_level = LOG_CRIT;
+    } else if (!strncmp(loglevel, "DEBUG", sizeof(loglevel-1))) {
+        g_log_level = LOG_DEBUG;
+    } else {
+        g_log_level = LOG_INFO;
     }
+
+    openlog(program_invocation_short_name, LOG_NDELAY | LOG_PID | LOG_CONS,
+            LOG_DAEMON);
 
     /* Disable SIGHUP, until handlers are installed
      * This was used to rotate logs.  Leave it ignored, since
