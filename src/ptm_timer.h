@@ -1,4 +1,11 @@
-/* Copyright 2013 Cumulus Networks, Inc.  All rights reserved. */
+/* Copyright 2013 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2014,2015,2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
+ */
 
 #ifndef _PTM_TIMER_H_
 #define _PTM_TIMER_H_
@@ -12,7 +19,7 @@
  * Usage:
  *    timer = cl_timer_create();
  *    ...
- *    cl_timer_arm(timer, cb, 5, T_UF_PERIOIDIC);
+ *    cl_timer_arm(timer, cb, 5, T_UF_PERIODIC);
  *
  *    void cb (cl_timer_t *t, void *c)
  *    {
@@ -24,7 +31,7 @@
 
 typedef struct _cl_timer_t_ cl_timer_t;
 
-#define T_UF_PERIOIDIC         (1 << 0)
+#define T_UF_PERIODIC          (1 << 0)
 #define T_UF_PERSIST_SSHOT     (1 << 1)
 #define T_UF_NSEC              (1 << 2)
 

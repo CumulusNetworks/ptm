@@ -1,6 +1,11 @@
-/*********************************************************************
- * Copyright 2013 Cumulus Networks, Inc.  All rights reserved.
+/* Copyright 2013,2015 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2016,2017 Cumulus Networks, Inc.  All rights reserved.
  *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
+
  * Parse the ptm.conf file, perform topology validation and send
  * notification on topo pass, topo fail and interface down events.
  *
@@ -9,22 +14,25 @@
 #include "ptm_conf.h"
 #include "log.h"
 #include "ptm_ctl.h"
-#include "ptm_msg.h"
-#include "csv.h"
+#include "ptm_lib.h"
+#include "ptm_bfd.h"
+#include "ptm_lldp.h"
+#include "ptm_timer.h"
 #include <sys/inotify.h>
 #include <libgen.h>
 #include <stdbool.h>
 #include <strings.h>
 
-static struct ptm_conf_network g_topo;
-
 typedef struct _ptm_conf_globals_t_ {
+    char graph_file[MAXNAMELEN+1];
+    char conf_dir[MAXNAMELEN+1];
     Agraph_t      *graph;
     ptm_globals_t *ptmg;
     char          *hostname;
-    char          *hostip;
-    int           file_wd;
-    unsigned int  topo_retry_cnt;
+    char          *mgmtip;
+    struct ptm_conf_port *ports;
+    char          err_str[CTL_MSG_SZ];
+    char          id_type;
 } ptm_conf_globals_t;
 
 ptm_conf_globals_t ptm_conf;
@@ -35,48 +43,58 @@ typedef enum {
 } ptm_conf_edge_dir_t;
 
 static char *HOST_ID_TYPE = "hostidtype";
+static char *HOST_NAME_TYPE = "hostnametype";
 static const char const *HOST_ID_TYPE_IP_STR = "ipaddr";
 static const char const *HOST_ID_TYPE_NAME_STR = "hostname";
+static const char const *HOST_NAME_TYPE_HOSTNAME_STR = "hostname";
+static const char const *HOST_NAME_TYPE_FQDN_STR = "fqdn";
 
 char const *PTM_PIDFILE = "/var/run/ptmd.pid";
-char const *PTM_LOGFILE = "/var/log/ptmd.log";
+/*
+ * since this is now set in rsyslog.conf, this isn't really right, but
+ * taking the logfile name out seems wrong also.
+ */
+char const *PTM_LOGFILE = "/var/log/ptmd.log"; /* may be incorrect... */
 char const *PTM_CONF_DIR = "/etc/ptm.d";
 char const *PTM_CONF_FILE = "topology.dot";
 char const *PTM_TOPO_PASS_FILE = "if-topo-pass";
 char const *PTM_TOPO_FAIL_FILE = "if-topo-fail";
-char const *PTM_TOPO_IFDOWN_FILE = "if-down";
+char const *PTM_TMP_CONF_FILE = "tmptopo";
 
 #define PTM_CONF_MAX_CMDS 16
-#define TOPO_RETRY_DISPLAY_INTERVAL 5
 
 struct ptm_conf_cmd_list {
     char *cmd_name;
-    ptm_cmd_rval (* cmd_cb) (ptm_event_t *, char *);
+    ptm_cmd_rval (* cmd_cb) (ptm_client_t *, void *);
 };
 
-static int ptm_conf_read(struct ptm_conf_network *topo);
+static int ptm_conf_read(ptm_globals_t *ptmg);
 static int ptm_conf_get_hostid_type(Agraph_t *g);
-static int ptm_conf_add_node(struct ptm_conf_network *topo, int host_id_type,
-                             char *hostname, char *host_addr, int me);
-static int ptm_conf_parse_graph (struct ptm_conf_network *topo, Agraph_t *g,
-				 struct ptm_conf_node *node, int reparse);
-static void ptm_conf_process_graph_entry (struct ptm_conf_network *topo,
-					  Agnode_t *gnode, Agedge_t *edge,
-					  ptm_conf_edge_dir_t direction,
-					  struct ptm_conf_node *node);
+static void ptm_conf_parse_graph ();
+static void ptm_conf_process_graph_entry (Agnode_t *gnode, Agedge_t *edge);
 static void ptm_conf_update_nbr_from_graph (struct ptm_conf_port *port,
-					    Agedge_t *edge,
-					    ptm_conf_edge_dir_t direction);
-static csv_t *ptm_conf_get_port_status(struct ptm_conf_port *port,
-                                       char *incmd, char *ret_msg);
-static void ptm_conf_notify_status_all_clients(struct ptm_conf_port *port,
-                                               char *);
-static ptm_cmd_rval ptm_conf_ctl_cmd_get_status (ptm_event_t *, char *);
-static ptm_cmd_rval ptm_conf_ctl_cmd_get_debug (ptm_event_t *, char *);
+					    Agedge_t *edge, char *nbrnode, char *nbrport);
+static void ptm_conf_get_status(void *, void *, char *, int *, int);
+static ptm_cmd_rval ptm_conf_ctl_cmd_get_status (ptm_client_t *, void *);
+static ptm_cmd_rval ptm_conf_ctl_cmd_start_bfd_sess (ptm_client_t *, void *);
+static ptm_cmd_rval ptm_conf_ctl_cmd_stop_bfd_sess (ptm_client_t *, void *);
+static ptm_cmd_rval ptm_conf_ctl_cmd_get_bfd_client (ptm_client_t *, void *);
+static ptm_cmd_rval ptm_conf_ctl_cmd_reg_bfd_client (ptm_client_t *, void *);
+static ptm_cmd_rval ptm_conf_ctl_cmd_dereg_bfd_client (ptm_client_t *, void *);
 
 static struct ptm_conf_cmd_list ptm_conf_cmds[PTM_CONF_MAX_CMDS] = {
-    {   .cmd_name = "get-status", .cmd_cb = ptm_conf_ctl_cmd_get_status},
-    {   .cmd_name = "get-debug", .cmd_cb = ptm_conf_ctl_cmd_get_debug},
+    {   .cmd_name = PTMLIB_CMD_GET_STATUS,
+                    .cmd_cb = ptm_conf_ctl_cmd_get_status},
+    {   .cmd_name = PTMLIB_CMD_START_BFD_SESS,
+                    .cmd_cb = ptm_conf_ctl_cmd_start_bfd_sess},
+    {   .cmd_name = PTMLIB_CMD_STOP_BFD_SESS,
+                    .cmd_cb = ptm_conf_ctl_cmd_stop_bfd_sess},
+    {   .cmd_name = PTMLIB_CMD_GET_BFD_CLIENT,
+                    .cmd_cb = ptm_conf_ctl_cmd_get_bfd_client},
+    {   .cmd_name = PTMLIB_CMD_REG_BFD_CLIENT,
+                    .cmd_cb = ptm_conf_ctl_cmd_reg_bfd_client},
+    {   .cmd_name = PTMLIB_CMD_DEREG_BFD_CLIENT,
+                    .cmd_cb = ptm_conf_ctl_cmd_dereg_bfd_client},
     {   .cmd_name = NULL},
 };
 
@@ -95,322 +113,379 @@ ptm_conf_init (ptm_globals_t *g)
 {
     int status;
 
-    g_topo.graph_file[MAXNAMELEN] = '\0';
-    strcpy(g_topo.graph_file, g->topo_file);
     ptm_conf.ptmg = g;
-    ptm_conf.hostname = g->my_hostname;
-    ptm_conf.hostip = g->my_mgmtip;
 
-    status = ptm_conf_read(&g_topo);
-    if (!status) {
-        g->conf_init_done = true;
-        g->hostname_changed = false;
-        g->mgmt_ip_changed = false;
-    } else {
-        ptm_conf_finish ();
+    ptm_conf_finish();
+
+    if (!g->my_hostname || !g->my_mgmtip) {
+        /* hostname/mgmtip missing - delay again */
+        sprintf (ptm_conf.err_str,
+            "No Hostname/MgmtIP found [Check LLDPD daemon status]");
+        DLOG("%s: Hostname (%s) and/or MgmtIP (%s) "
+             "still missing post-pone config read\n",
+             __FUNCTION__, g->my_hostname, g->my_mgmtip);
+        return -1;
     }
+
+    ptm_conf.graph_file[MAXNAMELEN] = '\0';
+    strcpy(ptm_conf.graph_file, g->topo_file);
+    strcpy(ptm_conf.conf_dir, PTM_CONF_DIR);
+    if (ptm_conf.hostname)
+        free(ptm_conf.hostname);
+    if (ptm_conf.mgmtip)
+        free(ptm_conf.mgmtip);
+    ptm_conf.hostname = strdup(g->my_hostname);
+    ptm_conf.mgmtip = strdup(g->my_mgmtip);
+
+    status = ptm_conf_read(g);
+
+    if (!status)
+        g->conf_init_done = TRUE;
+
     return (status);
 }
 
-int
-ptm_conf_reparse(ptm_globals_t *g)
+char *
+ptm_conf_get_conf_dir(void)
 {
-    int status = -1;
-
-    if (!ptm_conf.graph)
-        return status;
-
-    status = ptm_conf_parse_graph(&g_topo, ptm_conf.graph, &g_topo.me, TRUE);
-
-    return (status);
+    return ptm_conf.conf_dir;
 }
 
 void
-ptm_conf_topo_action (struct ptm_conf_port *port, bool pass)
+ptm_conf_topo_action (void *p_ctxt, bool pass)
 {
-    char cmd[CMD_SZ];
-    char msgbuf[CTL_MSG_SZ];
+    char *cmd;
+    char *msgbuf;
 
-    if (pass) {
-        ptm_conf_notify_status_all_clients(port, msgbuf);
-        sprintf(cmd, "%s/%s \"%s \"&", PTM_CONF_DIR, PTM_TOPO_PASS_FILE,
-                msgbuf);
-        system(cmd);
-    } else {
-        ptm_conf_notify_status_all_clients(port, msgbuf);
-        sprintf(cmd, "%s/%s \"%s \"&", PTM_CONF_DIR, PTM_TOPO_FAIL_FILE,
-                msgbuf);
-        system(cmd);
-    }
+    if ((cmd = malloc(CMD_SZ)) == NULL)
+        return;
+    if ((msgbuf = malloc(CTL_MSG_SZ)) == NULL)
+        return;
+    ptm_conf_notify_status_all_clients(p_ctxt, msgbuf,
+                            CTL_MSG_SZ, CONF_MODULE);
+    sprintf(cmd, "%s/%s &", ptm_conf_get_conf_dir(),
+            (pass)? PTM_TOPO_PASS_FILE:PTM_TOPO_FAIL_FILE);
+    system(cmd);
+    free(msgbuf);
+    free(cmd);
 }
 
-static void
-ptm_conf_notify_status_all_clients(struct ptm_conf_port *port, char *ret_msg)
+void
+ptm_conf_notify_status_all_clients(void *data, char *retbuf,
+                                   int retlen, int module)
 {
     ptm_client_t *client, *save;
-    csv_t *csv;
+    void *ctxt = NULL;
 
-    csv = ptm_conf_get_port_status(port, "get-status", ret_msg);
+    /* create a get-status cmd */
+    ptm_lib_init_msg(ptm_conf.ptmg->ptmlib_hdl, 0,
+                     PTMLIB_MSG_TYPE_CMD, NULL, &ctxt);
+    ptm_lib_append_msg(ptm_conf.ptmg->ptmlib_hdl, ctxt,
+                       "cmd", PTMLIB_CMD_GET_STATUS);
+    ptm_lib_append_msg(ptm_conf.ptmg->ptmlib_hdl, ctxt,
+                       "module", ptm_module_string(module));
 
-    if (!csv)
-        return;
+    /* get the response */
+    ptm_conf_get_status(data, ctxt, retbuf, &retlen, TRUE);
+
+    /* clean up the local cmd */
+    ptm_lib_complete_msg(ptm_conf.ptmg->ptmlib_hdl, ctxt, NULL, NULL);
 
     for (client = ptm_client_safe_iter(&save); client;
          client = ptm_client_safe_iter_next(&save)) {
-        ptm_ctl_send(client, ret_msg, csvlen(csv));
-        ptm_ctl_send(client, PTM_MSG_EOF_STR, PTM_MSG_EOF_LEN);
-    }
 
-    csv_clean(csv);
-    csv_free(csv);
-}
+        /* dont send notifications to clients that have not sent a request
+         * every client is expected to send a request before getting
+         * notifications
+         */
+        if (!(PTM_CLIENT_GET_FLAGS(client) & PTM_CLIENT_REQUEST_RECD)) {
+            continue;
+        }
 
-static csv_t *
-ptm_conf_get_port_status(struct ptm_conf_port *port,
-                         char *incmd,
-                         char *ret_msg)
-{
-    csv_t *csv = NULL;
-    csv_record_t *ptm_hrec;
-    csv_record_t *mod_hrec, *tmp_hrec;
-    csv_record_t *mod_drec, *tmp_drec;
-    char localbuf[CTL_MSG_SZ];
-    char *msgbuf = localbuf;
-    int m;
-    ptm_cmd_rval rval = PTM_CMD_OK;
-    char cmdline[MAX_ARGLEN];
-    char *opt = NULL;
+        ptm_ctl_send(client, retbuf, retlen);
 
-    if (ret_msg)
-        msgbuf = ret_msg;
-
-    strcpy(cmdline, incmd);
-    strtok_r(cmdline, " ", &opt);
-
-    /* Initialize csv for using discrete record buffers */
-    csv = csv_init(csv, NULL, CTL_MSG_SZ);
-    ptm_hrec = ptm_msg_encode_header(csv, NULL, 0, PTM_VERSION);
-
-    mod_hrec = mod_drec = NULL;
-
-    for (m = 0; m < MAX_MODULE; m++ ) {
-        if (PTM_MODULE_STATUSCB(ptm_conf.ptmg, m)) {
-            rval = PTM_MODULE_STATUSCB(ptm_conf.ptmg, m)(csv,
-                        &tmp_hrec, &tmp_drec, opt, port);
-
-            if (rval != PTM_CMD_OK) {
-                ERRLOG("status_cb module %s rval %s\n",
-                       ptm_module_string(m), ptm_cmd_rval_string(rval));
-                break;
-            }
-
-            /* concat the records returned by each module */
-            if (mod_hrec)
-                mod_hrec = csv_concat_record(csv, mod_hrec, tmp_hrec);
-            else
-                mod_hrec = tmp_hrec;
-
-            if (mod_drec)
-                mod_drec = csv_concat_record(csv, mod_drec, tmp_drec);
-            else
-                mod_drec = tmp_drec;
-
-            if (csvlen(csv) > CTL_MSG_SZ) {
-                /* should not happen !! */
-                ERRLOG("%s: Exceeded message buffer\n", __FUNCTION__);
-                break;
-            }
+        if (PTM_CLIENT_GET_FLAGS(client) & PTM_CLIENT_MARK_FOR_DELETION) {
+            ptm_client_delete(client);
         }
     }
-
-    /* wrap up csv */
-    ptm_msg_encode_header(csv, ptm_hrec, (csvlen(csv) - PTM_MSG_HEADER_LENGTH),
-                          PTM_VERSION);
-
-    /* parse csv contents into string */
-    csv_serialize(csv, msgbuf);
-
-    if (rval != PTM_CMD_OK) {
-        csv_clean(csv);
-        csv_free(csv);
-        csv = NULL;
-    }
-
-    return csv;
 }
 
-static void ptm_conf_ctl_cmd_error (ptm_event_t *event, char *errstr)
+void
+ptm_conf_get_status(void *m_ctxt,
+                    void *in_ctxt,
+                    char *msgbuf,
+                    int  *msglen,
+                    int  notify)
 {
-    csv_t *csv = NULL;
-    csv_record_t *rec;
-    char msgbuf[CTL_MSG_SZ];
-    int buflen = 0;
+    int m, type;
+    ptm_cmd_rval rval = PTM_CMD_OK;
+    void *out_ctxt = NULL;
 
-    csv = csv_init(csv, msgbuf, CTL_MSG_SZ);
-    rec = ptm_msg_encode_header(csv, NULL, 0, PTM_VERSION);
+    if (notify)
+        type = PTMLIB_MSG_TYPE_NOTIFICATION;
+    else
+        type = PTMLIB_MSG_TYPE_RESPONSE;
 
-    /* first the header */
-    csv_encode(csv, 2, "cmd", "error");
+    ptm_lib_init_msg(ptm_conf.ptmg->ptmlib_hdl, 0, type, NULL, &out_ctxt);
 
-    /* now the data */
-    csv_encode(csv, 2, event->client->inbuf, errstr);
+    for (m = 0; m < MAX_MODULE; m++ ) {
+        if (!PTM_MODULE_STATUSCB(ptm_conf.ptmg, m)) continue;
 
-    /* wrap up csv */
-    buflen = csvlen(csv);
-    ptm_msg_encode_header(csv, rec, (buflen - PTM_MSG_HEADER_LENGTH),
-                          PTM_VERSION);
+        rval = PTM_MODULE_STATUSCB(ptm_conf.ptmg, m)(m_ctxt, in_ctxt, out_ctxt);
 
-    DLOG("Sending %s\n", msgbuf);
-    ptm_ctl_send(event->client, msgbuf, buflen);
-
-    csv_clean(csv);
-    csv_free(csv);
-
-    ptm_ctl_send(event->client, PTM_MSG_EOF_STR, PTM_MSG_EOF_LEN);
-}
-
-static void ptm_conf_ctl_cmd_unknown (ptm_event_t *event, char *arg)
-{
-    csv_t *csv = NULL;
-    csv_record_t *rec;
-    char msgbuf[CTL_MSG_SZ];
-    int buflen = 0;
-
-    csv = csv_init(csv, msgbuf, CTL_MSG_SZ);
-    rec = ptm_msg_encode_header(csv, NULL, 0, PTM_VERSION);
-
-    /* first the header */
-    csv_encode(csv, 2, "cmd", "status");
-
-    /* now the data */
-    csv_encode(csv, 2, arg, "Unsupported command");
-
-    /* wrap up csv */
-    buflen = csvlen(csv);
-    ptm_msg_encode_header(csv, rec, (buflen - PTM_MSG_HEADER_LENGTH),
-                          PTM_VERSION);
-
-    DLOG("Sending %s\n", msgbuf);
-    ptm_ctl_send(event->client, msgbuf, buflen);
-
-    csv_clean(csv);
-    csv_free(csv);
-
-    ptm_ctl_send(event->client, PTM_MSG_EOF_STR, PTM_MSG_EOF_LEN);
-}
-
-static ptm_cmd_rval
-ptm_conf_ctl_cmd_get_debug (ptm_event_t *event, char *args)
-{
-    ptm_module_e m;
-    ptm_cmd_rval rval;
-    char *modstr;
-    int found = 0;
-    csv_t *csv = NULL;
-    csv_record_t *ptm_hrec;
-    char msgbuf[CTL_MSG_SZ];
-    char errstr[CTL_MSG_SZ];
-
-    if (!ptm_conf.graph) {
-        sprintf(errstr,
-            "No valid topology file. Check %s/%s",
-            PTM_CONF_DIR, PTM_CONF_FILE);
-        ptm_conf_ctl_cmd_error (event, errstr);
-        return PTM_CMD_OK;
-    }
-
-    if (!g_topo.me.ports) {
-        sprintf(errstr,
-            "No ports configured. Check %s/%s",
-            PTM_CONF_DIR, PTM_CONF_FILE);
-        ptm_conf_ctl_cmd_error (event, errstr);
-        return PTM_CMD_OK;
-    }
-
-    /* get debug cmd has only one option at this point */
-    modstr = strtok_r(NULL, " ", &args);
-
-    for (m = 0; modstr && m < MAX_MODULE; m++ ) {
-        if (!strcasecmp(modstr, ptm_module_string(m)) &&
-            PTM_MODULE_DEBUGCB(ptm_conf.ptmg, m)) {
-            found = 1;
+        if (rval != PTM_CMD_OK) {
+            ERRLOG("status_cb module %s rval %s\n",
+                    ptm_module_string(m), ptm_cmd_rval_string(rval));
             break;
         }
     }
 
-    if (modstr && !found) {
-        return PTM_CMD_UNKNOWN;
-    } else if (!modstr) {
-        /* default get LLDP debug */
-        m = LLDP_MODULE;
-    }
+    ptm_lib_complete_msg(ptm_conf.ptmg->ptmlib_hdl, out_ctxt, msgbuf, msglen);
 
+    return;
+}
 
-    /* Initialize csv for using discrete record buffers */
-    csv = csv_init(csv, NULL, CTL_MSG_SZ);
-    ptm_hrec = ptm_msg_encode_header(csv, NULL, 0, PTM_VERSION);
+void
+ptm_conf_ctl_cmd_status (ptm_client_t *client, void *in_ctxt,
+                         char *arg, char *ext_arg)
+{
+    char *msgbuf;
+    int buflen = CTL_MSG_SZ;
+    void *out_ctxt;
 
-    rval = PTM_MODULE_DEBUGCB(ptm_conf.ptmg, m)(csv, NULL, NULL,
-                              NULL, NULL, errstr);
+    if ((msgbuf = malloc(buflen)) == NULL)
+        return;
 
-    DLOG("Got module %s rval %d \n", ptm_module_string(m), rval);
+    ptm_lib_init_msg(ptm_conf.ptmg->ptmlib_hdl, 0,
+                     PTMLIB_MSG_TYPE_RESPONSE, in_ctxt, &out_ctxt);
+    ptm_lib_append_msg(ptm_conf.ptmg->ptmlib_hdl, out_ctxt,
+                       "cmd_status", arg);
+    ptm_lib_append_msg(ptm_conf.ptmg->ptmlib_hdl, out_ctxt,
+                       "cmd_ext_status", ext_arg);
+    ptm_lib_complete_msg(ptm_conf.ptmg->ptmlib_hdl, out_ctxt,
+                         msgbuf, &buflen);
+
+    DLOG("Sending %s\n", msgbuf);
+    ptm_ctl_send(client, msgbuf, buflen);
+    free(msgbuf);
+}
+
+static ptm_cmd_rval
+ptm_conf_ctl_cmd_get_bfd_client (ptm_client_t *client, void *in_ctxt)
+{
+    ptm_cmd_rval rval;
+    char msgbuf[CTL_MSG_SZ];
+    char errstr[CTL_MSG_SZ];
+
+    /* call into bfd handler */
+    rval = ptm_bfd_get_client_handler(client, in_ctxt, msgbuf);
 
     if (rval != PTM_CMD_OK) {
-        ptm_conf_ctl_cmd_error (event, errstr);
-        rval = PTM_CMD_OK;
-    } else {
-
-        /* wrap up csv */
-        ptm_msg_encode_header(csv, ptm_hrec, (csvlen(csv) - PTM_MSG_HEADER_LENGTH),
-                PTM_VERSION);
-
-        /* parse csv contents into string */
-        csv_serialize(csv, msgbuf);
-
-        DLOG("Sending %s\n", msgbuf);
-        ptm_ctl_send(event->client, msgbuf, csvlen(csv));
-        ptm_ctl_send(event->client, PTM_MSG_EOF_STR, PTM_MSG_EOF_LEN);
+        sprintf(errstr,
+            "%s - please check %s for more info",
+            msgbuf, PTM_LOGFILE);
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", errstr);
+        return PTM_CMD_OK;
     }
 
-    csv_clean(csv);
-    csv_free(csv);
     return PTM_CMD_OK;
 }
 
 static ptm_cmd_rval
-ptm_conf_ctl_cmd_get_status (ptm_event_t *event, char *args)
+ptm_conf_ctl_cmd_reg_bfd_client (ptm_client_t *client, void *in_ctxt)
 {
-    struct ptm_conf_port *port, *tmp;
-    csv_t *csv;
+    ptm_cmd_rval rval;
+    char msgbuf[CTL_MSG_SZ];
+    char errstr[CTL_MSG_SZ];
+
+    /* call into bfd handler */
+    rval = ptm_bfd_reg_client_handler(client, in_ctxt, msgbuf);
+
+    if (rval != PTM_CMD_OK) {
+        sprintf(errstr,
+            "%s - please check %s for more info",
+            msgbuf, PTM_LOGFILE);
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", errstr);
+        return PTM_CMD_OK;
+    }
+
+    return PTM_CMD_OK;
+}
+
+static ptm_cmd_rval
+ptm_conf_ctl_cmd_dereg_bfd_client (ptm_client_t *client, void *in_ctxt)
+{
+    ptm_cmd_rval rval;
+    char msgbuf[CTL_MSG_SZ];
+    char errstr[CTL_MSG_SZ];
+
+    /* call into bfd handler */
+    rval = ptm_bfd_dereg_client_handler(client, in_ctxt, msgbuf);
+
+    if (rval != PTM_CMD_OK) {
+        sprintf(errstr,
+            "%s - please check %s for more info",
+            msgbuf, PTM_LOGFILE);
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", errstr);
+        return PTM_CMD_OK;
+    }
+
+    return PTM_CMD_OK;
+}
+
+
+static ptm_cmd_rval
+ptm_conf_ctl_cmd_stop_bfd_sess (ptm_client_t *client, void *in_ctxt)
+{
+    ptm_cmd_rval rval;
+    char errstr[CTL_MSG_SZ];
     char msgbuf[CTL_MSG_SZ];
 
+    /* call into bfd handler */
+    rval = ptm_bfd_stop_client_sess(client, in_ctxt, msgbuf);
 
-    if (!ptm_conf.graph) {
-        sprintf(msgbuf,
-            "No valid topology file. Check %s/%s",
-            PTM_CONF_DIR, PTM_CONF_FILE);
-        ptm_conf_ctl_cmd_error (event, msgbuf);
+    if (rval != PTM_CMD_OK) {
+        sprintf(errstr,
+            "%s - please check %s for more info",
+            msgbuf, PTM_LOGFILE);
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", errstr);
         return PTM_CMD_OK;
     }
 
-    if (!g_topo.me.ports) {
-        sprintf(msgbuf,
-            "No ports configured. Check %s/%s",
-            PTM_CONF_DIR, PTM_CONF_FILE);
-        ptm_conf_ctl_cmd_error (event, msgbuf);
+    return PTM_CMD_OK;
+}
+
+static ptm_cmd_rval
+ptm_conf_ctl_cmd_start_bfd_sess (ptm_client_t *client, void *in_ctxt)
+{
+    ptm_cmd_rval rval;
+    char msgbuf[CTL_MSG_SZ];
+    char errstr[CTL_MSG_SZ];
+
+    /* call into bfd handler */
+    rval = ptm_bfd_start_client_sess(client, in_ctxt, msgbuf);
+
+    if (rval != PTM_CMD_OK) {
+        sprintf(errstr,
+            "%s - please check %s for more info",
+            msgbuf, PTM_LOGFILE);
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", errstr);
         return PTM_CMD_OK;
     }
 
-    HASH_ITER(ph, g_topo.me.ports, port, tmp) {
-        csv = ptm_conf_get_port_status(port, event->client->inbuf, msgbuf);
-        if (csv) {
-            ptm_ctl_send(event->client, msgbuf, csvlen(csv));
-            csv_clean(csv);
-            csv_free(csv);
-        }
+    return PTM_CMD_OK;
+}
+
+static void
+ptm_conf_get_lldp_status(ptm_client_t *client, void *in_ctxt)
+{
+    void *lldp = NULL;
+    char msgbuf[CTL_MSG_SZ];
+    int msglen;
+    int found = FALSE;
+
+    if (strlen(ptm_conf.err_str)) {
+        sprintf(msgbuf,
+            "%s - please check %s for more info",
+            ptm_conf.err_str, PTM_LOGFILE);
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", msgbuf);
+        return;
     }
 
-    ptm_ctl_send(event->client, PTM_MSG_EOF_STR, PTM_MSG_EOF_LEN);
+    while((lldp = ptm_lldp_get_next_sess_iter(lldp)) != NULL) {
+        found = TRUE;
+        msglen = sizeof(msgbuf);
+        ptm_conf_get_status(lldp, in_ctxt, msgbuf, &msglen, FALSE);
+        ptm_ctl_send(client, msgbuf, msglen);
+    }
+
+    if (!found) {
+        sprintf(msgbuf,
+                "No LLDP ports detected. Check connections");
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", msgbuf);
+        return;
+    }
+}
+
+static void
+ptm_conf_get_bfd_status(ptm_client_t *client, void *in_ctxt)
+{
+    bfd_status_ctxt_t b_ctxt;
+    void *bfd = NULL;
+    char msgbuf[CTL_MSG_SZ];
+    int msglen;
+    int found = FALSE;
+
+    while((bfd = ptm_bfd_get_next_sess_iter(bfd)) != NULL) {
+        found = TRUE;
+        msglen = sizeof(msgbuf);
+        memset(&b_ctxt, 0x00, sizeof(b_ctxt));
+        b_ctxt.bfd = bfd;
+        ptm_conf_get_status(&b_ctxt, in_ctxt, msgbuf, &msglen, FALSE);
+        ptm_ctl_send(client, msgbuf, msglen);
+    }
+
+    if (!found) {
+        sprintf(msgbuf,
+                "No BFD sessions . Check connections");
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", msgbuf);
+        return;
+    }
+}
+
+static void
+ptm_conf_get_port_status(ptm_client_t *client, void *in_ctxt)
+{
+    struct ptm_conf_port *port, *tmp;
+    ptm_status_ctxt_t p_ctxt;
+    char msgbuf[CTL_MSG_SZ];
+    int msglen;
+
+    if (strlen(ptm_conf.err_str)) {
+        sprintf(msgbuf,
+            "%s - please check %s for more info",
+            ptm_conf.err_str, PTM_LOGFILE);
+        ptm_conf_ctl_cmd_status (client, in_ctxt, "fail", msgbuf);
+        return;
+    }
+
+    HASH_ITER(ph, ptm_conf.ports, port, tmp) {
+        p_ctxt.port = port;
+        p_ctxt.bfd_get_next = TRUE;
+        p_ctxt.bfd_peer[0] = '\0';
+
+        /* there can be multiple bfd sessions per interface due to
+         * afi=BFD_AFI_BOTH param.
+         */
+        do {
+            char prev[MAXNAMELEN];
+            msglen = sizeof(msgbuf);
+            strcpy(prev, p_ctxt.bfd_peer);
+            ptm_conf_get_status(&p_ctxt, in_ctxt, msgbuf, &msglen, FALSE);
+            if (!strlen(prev) || strlen(p_ctxt.bfd_peer))
+                ptm_ctl_send(client, msgbuf, msglen);
+        } while (strlen(p_ctxt.bfd_peer));
+    }
+}
+
+static ptm_cmd_rval
+ptm_conf_ctl_cmd_get_status (ptm_client_t *client, void *in_ctxt)
+{
+    char val[MAXNAMELEN];
+
+    if (ptm_lib_find_key_in_msg(in_ctxt, "module", val) < 0)
+        strcpy(val, ptm_module_string(CONF_MODULE));
+
+    if (!strcasecmp(val, ptm_module_string(BFD_MODULE))) {
+        /* user asking for BFD status only */
+        ptm_conf_get_bfd_status(client, in_ctxt);
+    } else if (!strcasecmp(val, ptm_module_string(LLDP_MODULE))) {
+        /* user asking for LLDP status only */
+        ptm_conf_get_lldp_status(client, in_ctxt);
+    } else {
+        /* default to topology file based status */
+        ptm_conf_get_port_status(client, in_ctxt);
+    }
 
     return PTM_CMD_OK;
 }
@@ -422,34 +497,24 @@ ptm_conf_free_node (void *data)
         free (data);
 }
 
-void
-ptm_conf_process_client_query(ptm_event_t *event)
+int
+ptm_conf_process_client_cmd(void *arg, void *in_ctxt)
 {
+    ptm_client_t *client = arg;
     int cmd_num;
-    char *sargs = NULL;
-    char *cmd;
+    char cmd[MAXNAMELEN];
     ptm_cmd_rval rval;
-    char in_args[MAX_ARGLEN];
 
-    assert(strlen(event->client->inbuf) <= MAX_ARGLEN);
-
-    strcpy(in_args, event->client->inbuf);
-    INFOLOG("%s args %s\n", __FUNCTION__, event->client->inbuf);
-
-    if (strlen(event->client->inbuf) < 1)
-        return;
-
-    /* check for cmd */
-    cmd = strtok_r(in_args, " ", &sargs);
-
+    ptm_lib_find_key_in_msg(in_ctxt, "cmd", cmd);
     for (cmd_num = 0; cmd_num < PTM_CONF_MAX_CMDS; cmd_num++) {
         if ((ptm_conf_cmds[cmd_num].cmd_name) &&
             (strncmp(ptm_conf_cmds[cmd_num].cmd_name, cmd,
                     strlen(ptm_conf_cmds[cmd_num].cmd_name)) == 0)) {
-            rval = ptm_conf_cmds[cmd_num].cmd_cb(event, sargs);
+            PTM_CLIENT_SET_FLAGS(client, PTM_CLIENT_REQUEST_RECD);
+            rval = ptm_conf_cmds[cmd_num].cmd_cb(client, in_ctxt);
             if (rval != PTM_CMD_OK) {
                 ERRLOG("%s: command %s error %s\n", __FUNCTION__,
-                       event->client->inbuf, ptm_cmd_rval_string(rval));
+                       cmd, ptm_cmd_rval_string(rval));
                 break;
             }
         }
@@ -457,65 +522,151 @@ ptm_conf_process_client_query(ptm_event_t *event)
 
     if (rval == PTM_CMD_UNKNOWN) {
         ERRLOG("%s: Unknown command %s received from client fd %d\n",
-           __FUNCTION__, event->client->inbuf, event->client->fd);
-        ptm_conf_ctl_cmd_unknown(event, cmd);
+           __FUNCTION__, cmd, client->fd);
+        ptm_conf_ctl_cmd_status (client, in_ctxt,
+                                 "fail", "Command Unsupported");
     }
-    return;
+
+    return 0;
+}
+
+/* Goal of this routine is to parse
+ * the topo file and eliminate
+ * DOT file semantics that might cause
+ * unintended behavior when we call agread and
+ * subsequent attribute parsing
+ */
+static FILE *
+ptm_conf_pre_parse_topo_file(FILE *fs)
+{
+    char buf[1024];
+    char file[MAXNAMELEN];
+    char *s, *rpl;
+    FILE *newfs;
+    int lineno = 0;
+
+    DLOG ("Pre-parse topology file\n");
+
+    /* open a temp filestream for saving modifications */
+    sprintf(file, "%s/%s", PTM_CONF_DIR, PTM_TMP_CONF_FILE);
+    newfs = fopen(file, "w");
+    if (!newfs) {
+        INFOLOG ("Could not open tmp file for preparse [%m]\n");
+        return fs;
+    }
+    while(fgets(buf, 1024, fs) != NULL) {
+        lineno++;
+        /*
+         * replace empty string module keyword BFD=""
+         * with BFD="default"
+         */
+        if ((s = strstr(buf, ptm_module_string(BFD_MODULE))) != NULL) {
+            s += strlen(ptm_module_string(BFD_MODULE));
+            /* skip over spaces */
+            while (*s == ' ')s++;
+            if (*s == '=') {
+                s++;
+                /* skip over spaces */
+                while (*s == ' ')s++;
+                if ((*s == '"') && (*(s+1) == '"')) {
+                    /* empty string supplied
+                     * replace "" with "default"
+                     */
+                    char *dflt = "default";
+                    char tmpbuf[1024];
+                    DLOG("Empty BFD param detected - replace (line %d)\n",
+                         lineno);
+                    rpl = s+1;
+                    strcpy(tmpbuf, rpl);
+                    strcpy(rpl, dflt);
+                    rpl+=strlen(dflt);
+                    strcpy(rpl, tmpbuf);
+                }
+            }
+        }
+        /*
+         * replace "tailport"/"headport" param with "taxxport"/"hexxport"
+         */
+        if ((s = strstr(buf, HEADPORT_ID)) != NULL) {
+            s[2] = s[3] = 'x';
+            DLOG("%s detected - replace (line %d)\n", HEADPORT_ID, lineno);
+        }
+        if ((s = strstr(buf, TAILPORT_ID)) != NULL) {
+            s[2] = s[3] = 'x';
+            DLOG("%s detected - replace (line %d)\n", TAILPORT_ID, lineno);
+        }
+        fputs(buf, newfs);
+    }
+
+    /* cannot get agread to work properly without close/re-open of file */
+    fflush(newfs);
+    fclose(newfs);
+    newfs = fopen(file, "r");
+    if (!newfs) {
+        INFOLOG ("Could not re-open tmp file for preparse [%m]\n");
+        return fs;
+    }
+    /* close the old filestream */
+    fclose(fs);
+    return newfs;
 }
 
 static int
-ptm_conf_read (struct ptm_conf_network *topo)
+ptm_conf_read(ptm_globals_t *ptmg)
 {
     Agraph_t *g;
-    int id_type = PTM_HOST_ID_TYPE_NAME;
-    FILE *filestream;
-    int status;
+    FILE *filestream = NULL;
+    int fd;
+    char *str;
 
-    if (topo == NULL) {
-        /* XX: Log error */
-        return (-1);
+    DLOG ("Reading topology file %s\n", ptm_conf.graph_file);
+
+    fd = open(ptm_conf.graph_file, 0, S_IRUSR);
+    if (fd) {
+        fsync(fd);
+        filestream = fdopen(fd, "r");
     }
-
-    filestream = fopen(topo->graph_file, "r");
     if (filestream == NULL) {
-        ERRLOG ("File Open fail! %s, errno=%d\n", topo->graph_file, errno);
+        sprintf (ptm_conf.err_str,
+                "Topology file error [%s] [cannot open file]",
+                ptm_conf.graph_file);
+        ERRLOG ("%s - check file existence and permissions\n",
+                ptm_conf.err_str);
         return (-1);
     }
-    if (ptm_conf.graph != NULL) {
-        agclose(ptm_conf.graph);
-        ptm_conf.graph = NULL;
-    }
+
+    /* parse the topo file and prep it for agread */
+    filestream = ptm_conf_pre_parse_topo_file(filestream);
+
     g = agread(filestream, NIL(Agdisc_t *));
 
     if (g == NULL) {
-        ERRLOG ("agread failed (%s)\n", aglasterr());
+        str = aglasterr();
+        if (!str || !strlen(str))
+            str = "parse failure";
+        sprintf (ptm_conf.err_str,
+                "Topology file error [%s] [%s]",
+                ptm_conf.graph_file, str);
+        ERRLOG ("%s - Need to restart PTMD after fixing syntax error\n",
+                ptm_conf.err_str);
         fclose(filestream);
         return (-1);
     }
     ptm_conf.graph = g;
-
     fclose(filestream);
-    /* How do I know who I am ? IP Addr or name ? */
-    id_type = ptm_conf_get_hostid_type (g);
 
-    switch (id_type) {
-    case PTM_HOST_ID_TYPE_NAME:
-        ptm_conf_add_node (topo, id_type, ptm_conf.hostname, ptm_conf.hostip, TRUE);
-        break;
-    case PTM_HOST_ID_TYPE_IP:
-        ptm_conf_add_node (topo, id_type, NULL, ptm_conf.hostip, TRUE);
-        break;
-    default:
-        /* XX: Log error */
-        ERRLOG ("idtype %d not supported\n", id_type);
-        return (-1);
-        break;
+    if (ptm_conf_get_hostname_type () == PTM_HOST_NAME_TYPE_HOSTNAME) {
+        ptmg->my_hostname = ptm_conf_prune_hostname(ptmg->my_hostname);
+        free(ptm_conf.hostname);
+        ptm_conf.hostname = strdup(ptmg->my_hostname);
     }
 
-    /* Fill in the topo data structure */
-    status = ptm_conf_parse_graph(topo, g, &(topo->me), FALSE);
+    ptm_conf.id_type = ptm_conf_get_hostid_type (g);
 
-    return (status);
+    /* Fill in the topo data structure */
+    ptm_conf_parse_graph();
+
+    return 0;
 }
 
 static int
@@ -537,69 +688,43 @@ ptm_conf_get_hostid_type (Agraph_t *g)
     return (id_type);
 }
 
-static int
-ptm_conf_add_node (struct ptm_conf_network *topo, int host_id_type,
-		   char *hostname, char *host_addr, int me)
+int
+ptm_conf_get_hostname_type (void)
 {
-    if (me) {
-        if (host_addr != NULL) {
-            strncpy(topo->me.mgmt_ip_addr, host_addr,
-                    INET6_ADDRSTRLEN);
-            topo->me.mgmt_ip_addr[INET6_ADDRSTRLEN] = '\0';
-        }
+    char *attr;
+    int name_type = PTM_HOST_NAME_TYPE_HOSTNAME;
+    Agraph_t *g = ptm_conf.graph;
 
-        if (hostname != NULL) {
-            topo->me.node_name[MAXNAMELEN] = '\0';
-            strncpy(topo->me.node_name, hostname, MAXNAMELEN);
-        } else if (host_addr) {
-            strncpy(topo->me.node_name, host_addr, MAXNAMELEN);
-        }
-
-        topo->me.id_type = host_id_type;
+    attr = agget(g, HOST_NAME_TYPE);
+    if (attr != NULL) {
+        if (strcmp (attr, HOST_NAME_TYPE_HOSTNAME_STR) == 0)
+            name_type = PTM_HOST_NAME_TYPE_HOSTNAME;
+        else if (strcmp (attr, HOST_NAME_TYPE_FQDN_STR) == 0)
+            name_type = PTM_HOST_NAME_TYPE_FQDN;
+        else
+            name_type = PTM_HOST_NAME_TYPE_UNKNOWN;
     }
-    return (0);
+
+    return (name_type);
 }
 
 static struct ptm_conf_port *
-ptm_conf_add_port (struct ptm_conf_network *topo, struct ptm_conf_node *node,
-		   char *portname, char *mac_addr,
-		   ptm_conf_nbr_cmp_attr_t cmp_type)
+ptm_conf_add_port (char *portname)
 {
-    char *key;
-    int keylen;
     struct ptm_conf_port *hport = NULL;
 
-    assert (topo != NULL);
-    assert (node != NULL);
-
-    key = (cmp_type == PTM_NBR_CMP_PORT ? portname : mac_addr);
-    keylen = (cmp_type == PTM_NBR_CMP_PORT ? strlen(key) : MAC_ADDR_SIZE);
-    assert (keylen != 0);
-
-    HASH_FIND(ph, node->ports, key, keylen, hport);
+    HASH_FIND(ph, ptm_conf.ports, portname, strlen(portname), hport);
     if (!hport) {
-        hport = (struct ptm_conf_port *)calloc(1, sizeof(struct ptm_conf_port));
+        hport = (struct ptm_conf_port *)
+                    calloc(1, sizeof(struct ptm_conf_port));
         if (hport == NULL) {
-            ERRLOG ("Malloc Fail! Unable to allocate ptm_conf_nbr structure for "
-                    "port %s of node %s\n", key, node->node_name);
+            ERRLOG ("Malloc Fail! port %s of node %s\n",
+                    portname, ptm_conf.hostname);
             return (NULL);
         }
-        switch (cmp_type) {
-        case PTM_NBR_CMP_PORT:
-            hport->port_name[MAXNAMELEN] = '\0';
-            strncpy (hport->port_name, portname, MAXNAMELEN);
-            break;
-        case PTM_NBR_CMP_MAC:
-            hport->port_name[0] = '\0';
-            strncpy (hport->mac_addr, mac_addr, MAC_ADDR_SIZE);
-            break;
-        default:
-            ERRLOG ("Unrecognized port type %d in node %s\n", cmp_type, node->node_name);
-            break;
-        }
-
-        hport->cmp_attr = cmp_type;
-        HASH_ADD(ph, node->ports, port_name, keylen, hport);
+        hport->port_name[MAXNAMELEN] = '\0';
+        strncpy (hport->port_name, portname, MAXNAMELEN);
+        HASH_ADD(ph, ptm_conf.ports, port_name, strlen(portname), hport);
     }
 
     return (hport);
@@ -613,17 +738,15 @@ ptm_conf_parse_port_parms(struct ptm_conf_port *port, Agedge_t *edge)
 
     for (mod=LLDP_MODULE; mod != MAX_MODULE; mod++) {
         arg_str = agget(edge, ptm_module_string(mod));
-        if (!arg_str) {
+        if (!arg_str || !strlen(arg_str)) {
             /* check for global setting */
             arg_str = agget(ptm_conf.graph, ptm_module_string(mod));
         }
 
-        if (PTM_MODULE_GET_STATE(ptm_conf.ptmg, mod) == MOD_STATE_INITIALIZED) {
-            if (PTM_MODULE_PARSECB(ptm_conf.ptmg, mod)) {
-                PTM_MODULE_PARSECB(ptm_conf.ptmg, mod)(port, arg_str);
-            }
-        }
-        if (arg_str || (mod == LLDP_MODULE)) {
+        if (PTM_MODULE_PARSECB(ptm_conf.ptmg, mod))
+            PTM_MODULE_PARSECB(ptm_conf.ptmg, mod)(port, arg_str);
+
+        if ((arg_str && strlen(arg_str)) || (mod == LLDP_MODULE)) {
             port->en_mods |= (1 << mod);
             DLOG("Enabled module %s on port %s\n", ptm_module_string(mod),
                  port->port_name);
@@ -634,137 +757,90 @@ ptm_conf_parse_port_parms(struct ptm_conf_port *port, Agedge_t *edge)
     }
 }
 
-static int
-ptm_conf_parse_graph (struct ptm_conf_network *topo, Agraph_t *g,
-				 struct ptm_conf_node *node, int reparse)
+static void
+ptm_conf_parse_graph ()
 {
-    Agnode_t *gnode = NULL;
+    Agraph_t *g = ptm_conf.graph;
+    Agnode_t *gnode;
     Agedge_t *edge;
-    int id_type = PTM_HOST_ID_TYPE_NAME;
-    ptm_module_e mod;
+    char *node_ident;
 
-    /* XX: Handle IP addr based names later */
-    assert(node->node_name[0] != '\0');
-    id_type = ptm_conf_get_hostid_type (g);
-
-    switch(id_type) {
-    case PTM_HOST_ID_TYPE_NAME:
-        gnode = agnode(g, node->node_name, FALSE);
-        break;
+    switch(ptm_conf.id_type) {
     case PTM_HOST_ID_TYPE_IP:
-        gnode = agnode(g, node->mgmt_ip_addr, FALSE);
+        node_ident = ptm_conf.mgmtip;
         break;
+    case PTM_HOST_ID_TYPE_NAME:
     default:
-        ERRLOG("idtype %d not supported\n", id_type);
+        node_ident = ptm_conf.hostname;
+        break;
     }
+
+    gnode = agnode(g, node_ident, FALSE);
 
     if (gnode == NULL) {
-        if ((ptm_conf.topo_retry_cnt < TOPO_RETRY_DISPLAY_INTERVAL) ||
-            (ptm_conf.topo_retry_cnt % TOPO_RETRY_DISPLAY_INTERVAL)) {
-            ERRLOG ("Unable to find node %s in graph\n", node->node_name);
-        }
-        ptm_conf.topo_retry_cnt++;
-        return (-1);
+        sprintf (ptm_conf.err_str,
+                 "Topology file error [%s] [cannot find node %s]",
+                 ptm_conf.graph_file, node_ident);
+        return;
     }
 
-    for (edge = agfstin(g, gnode); edge; edge = agnxtin(g, edge)) {
-        ptm_conf_process_graph_entry(topo, gnode, edge, PTM_CONF_EDGE_IN, node);
+    for (edge = agfstedge(g, gnode);
+         edge;
+         edge = agnxtedge(g, edge, gnode)){
+        ptm_conf_process_graph_entry(gnode, edge);
     }
 
-    for (edge = agfstout(g, gnode); edge; edge = agnxtout(g, edge)) {
-        ptm_conf_process_graph_entry(topo, gnode, edge, PTM_CONF_EDGE_OUT, node);
-    }
-
-    for (mod = 0; mod < MAX_MODULE; mod++) {
-        if (PTM_MODULE_GET_STATE(ptm_conf.ptmg, mod) ==
-                                        MOD_STATE_INITIALIZED) {
-            PTM_MODULE_SET_STATE(ptm_conf.ptmg, mod, MOD_STATE_PARSE);
-        }
-    }
-
-    ptm_conf.topo_retry_cnt = 0;
-
-    return (0);
+    return;
 }
 
 static void
-ptm_conf_process_graph_entry (struct ptm_conf_network *topo, Agnode_t *gnode,
-			      Agedge_t *edge, ptm_conf_edge_dir_t direction,
-			      struct ptm_conf_node *node)
+ptm_conf_process_graph_entry (Agnode_t *gnode,
+                              Agedge_t *edge)
 {
+    char *headname, *tailname;
     char *ournode, *ourport;
+    char *nbrnode, *nbrport;
     struct ptm_conf_port *hport;
 
-    if (direction == PTM_CONF_EDGE_IN) {
-        ournode = agnameof(aghead(edge));
-        ourport = agget(edge, "headport");
+    headname = agnameof(aghead(edge));
+    tailname = agnameof(agtail(edge));
+
+    if (strcmp(headname, ptm_conf.hostname) == 0) {
+        ournode = headname;
+        ourport = agget(edge, HEADPORT_ID);
+        nbrnode = tailname;
+        nbrport = agget(edge, TAILPORT_ID);
     } else {
-        ournode = agnameof(agtail(edge));
-        ourport = agget(edge, "tailport");
+        ournode = tailname;
+        ourport = agget(edge, TAILPORT_ID);
+        nbrnode = headname;
+        nbrport = agget(edge, HEADPORT_ID);
     }
 
-    DLOG("Found edge for %s:%s\n", ournode, ourport);
+    DLOG("Found edge for %s:%s -- %s:%s\n", ournode, ourport,
+         nbrnode, nbrport);
 
-    if (strcmp(node->node_name, ournode) != 0) {
-        DLOG ("graph node %s is not us(%s) - ignore\n",
-                ournode, node->node_name);
-        return;
-    }
-
-    /* XX: Add support for MAC addresses later */
-    hport = ptm_conf_add_port(topo, node, ourport, NULL, PTM_NBR_CMP_PORT);
+    hport = ptm_conf_add_port(ourport);
     if (hport == NULL)
         return;
 
-    /* XX: Get iface oper state later. Not really needed */
-    ptm_conf_update_nbr_from_graph(hport, edge, direction);
+    ptm_conf_update_nbr_from_graph(hport, edge, nbrnode, nbrport);
 }
 
 static void
 ptm_conf_update_nbr_from_graph (struct ptm_conf_port *port, Agedge_t *edge,
-				ptm_conf_edge_dir_t direction)
+                                char *nbrnode, char *nbrport)
 {
-    char *nbrnode, *nbrport;
-    char *cmp_type_str;
-    ptm_conf_nbr_cmp_attr_t type;
- 
-    assert (port != NULL);
-    assert (edge != NULL);
-
-    if (direction == PTM_CONF_EDGE_IN) {
-        nbrnode = agnameof(agtail(edge));
-        nbrport = agget(edge, "tailport");
-    } else {
-        nbrnode = agnameof(aghead(edge));
-        nbrport = agget(edge, "headport");
-    }
-
-    /* select per-edge compare criterion */
-    cmp_type_str = agget(edge, "compare");
-
-    if (cmp_type_str == NULL)
-        type = PTM_NBR_CMP_PORT;
-    else if (strcmp(cmp_type_str, "macaddr") == 0)
-        type = PTM_NBR_CMP_MAC;
-    else {
-        ERRLOG ("Unknown Port Compare Type: %s, defaulting to port\n",
-                cmp_type_str);
-        type = PTM_NBR_CMP_PORT;
-    }
-
     /* pass port parms to all modules */
     ptm_conf_parse_port_parms(port, edge);
 
-    DLOG("cmp type %d\n", type);
+    port->nbr_sysname[MAXNAMELEN] = '\0';
+    if (nbrnode)
+        strncpy(port->nbr_sysname, nbrnode, MAXNAMELEN);
 
-    port->cmp_attr = type;
-    port->admin.sys_name[MAXNAMELEN] = '\0';
-    strncpy(port->admin.sys_name, nbrnode, MAXNAMELEN);
-
-    port->admin.port_ident[MAXNAMELEN] = '\0';
-    strncpy(port->admin.port_ident, nbrport, MAXNAMELEN);
-
-    time(&port->admin.last_change_time);
+    port->nbr_ident[MAXNAMELEN] = '\0';
+    if (nbrport)
+        strncpy(port->nbr_ident, nbrport, MAXNAMELEN);
 }
 
 int
@@ -782,21 +858,17 @@ ptm_conf_get_port_by_name(char *port_name)
     struct ptm_conf_port *port = NULL;
 
     if (!port_name || !strlen(port_name)) {
-        ERRLOG("%s: Invalid port name received\n", __func__);
-        return 0;
+        ERRLOG("%s: NULL port name received\n", __func__);
+        return NULL;
     }
 
-    if (g_topo.me.ports == NULL) {
-        DLOG("%s: Ignoring port update as no config exists\n", __func__);
-        return 0;
+    if (ptm_conf.ports == NULL) {
+        DLOG("%s: Ignoring port %s update as no config exists\n", __func__, port_name);
+        return NULL;
     }
 
-    HASH_FIND(ph, g_topo.me.ports, port_name, strlen(port_name), port);
+    HASH_FIND(ph, ptm_conf.ports, port_name, strlen(port_name), port);
 
-    if (port == NULL) {
-        //DLOG("Port %s: Unable to find port\n", port_name);
-        return 0;
-    }
     return port;
 }
 
@@ -806,21 +878,17 @@ ptm_conf_get_port(ptm_event_t *event)
     struct ptm_conf_port *port = NULL;
 
     if (!event || !event->liface || !strlen(event->liface)) {
-        ERRLOG("%s: Invalid event received\n", __func__);
-        return 0;
+        DLOG("%s: Invalid event received\n", __func__);
+        return NULL;
     }
 
-    if (g_topo.me.ports == NULL) {
-        DLOG("%s: Ignoring port update as no config exists\n", __func__);
-        return 0;
+    if (ptm_conf.ports == NULL) {
+        // DLOG("%s: Ignoring port update as no config exists\n", __func__);
+        return NULL;
     }
 
-    HASH_FIND(ph, g_topo.me.ports, event->liface, strlen(event->liface), port);
+    HASH_FIND(ph, ptm_conf.ports, event->liface, strlen(event->liface), port);
 
-    if (port == NULL) {
-        //DLOG("Port %s: Unable to find port\n", event->liface);
-        return 0;
-    }
     return port;
 }
 
@@ -829,16 +897,12 @@ ptm_conf_finish (void)
 {
     struct ptm_conf_port *tmp, *port;
 
-    if (g_topo.me.ports != NULL) {
-        HASH_ITER(ph, g_topo.me.ports, port, tmp) {
-            HASH_DELETE(ph, g_topo.me.ports, port);
+    if (ptm_conf.ports != NULL) {
+        HASH_ITER(ph, ptm_conf.ports, port, tmp) {
+            HASH_DELETE(ph, ptm_conf.ports, port);
             ptm_conf_free_node(port);
         }
-        g_topo.me.ports = NULL;
-    }
-
-    if (g_topo.nodes != NULL) {
-        assert (g_topo.nodes != NULL);
+        ptm_conf.ports = NULL;
     }
 
     if (ptm_conf.graph) {
@@ -846,9 +910,8 @@ ptm_conf_finish (void)
         ptm_conf.graph = NULL;
     }
 
-    if (ptm_conf.ptmg) {
-        ptm_conf.ptmg->conf_init_done = false;
-    }
+    ptm_conf.ptmg->conf_init_done = FALSE;
+    memset(ptm_conf.err_str, 0x00, sizeof(ptm_conf.err_str));
 }
 
 void
@@ -864,6 +927,45 @@ ptm_conf_get_template_str(char *tmpl_key, char *tmpl_str)
     }
 
     return;
+}
+
+int
+ptm_conf_parse_msec_parm(char *val)
+{
+    int value;
+
+    value = ptm_conf_parse_ulong_parm(val);
+
+    if (((value * MSEC_PER_SEC) >= LONG_MAX) ||
+        ((value * MSEC_PER_SEC) <= LONG_MIN)) {
+        ERRLOG("%s: out of range - skipping %ld\n", __FUNCTION__,
+               (value * MSEC_PER_SEC));
+        return -1;
+    }
+    return (value * MSEC_PER_SEC);
+}
+
+int
+ptm_conf_parse_ulong_parm(char *val)
+{
+    int errno, value;
+    char *eptr;
+
+    errno = 0;
+    value = strtol(val, &eptr, 10);
+
+    if ((errno == ERANGE && (value == LONG_MAX || value == LONG_MIN)) ||
+        (errno != 0 && value == 0)) {
+        ERRLOG("%s: out of range - skipping %d\n", __FUNCTION__, value);
+        return -1;
+    }
+
+    if (eptr == val) {
+        ERRLOG("%s: args not numeric - skipping\n", __FUNCTION__);
+        return -1;
+    }
+
+    return value;
 }
 
 void
@@ -887,7 +989,10 @@ ptm_conf_find_key_val(char *key_arg, char *args, char *val)
         if (key && !strcasecmp(key, key_arg)) {
             in_val = strtok_r(NULL, ",\n\0", &vargs);
             DLOG("%s: Found key [%s] val [%s]\n", __FUNCTION__, key, in_val);
-            strcpy(val, in_val);
+            if (in_val)
+                strcpy(val, in_val);
+            else
+                val[0] = '\0';
             break;
         }
         largs = strtok_r(NULL, ",\n\0", &sargs);
@@ -897,107 +1002,17 @@ ptm_conf_find_key_val(char *key_arg, char *args, char *val)
     return;
 }
 
-#if 0
-static void ptm_conf_init_watch ();
-static void ptm_conf_add_watch ();
-static void ptm_conf_remove_watch ();
-
-int
-ptm_conf_process_file_event (int fd, ptm_sockevent_e t, void *data)
+char *
+ptm_conf_prune_hostname(char *host_name)
 {
-#define EVENT_SIZE  (sizeof (struct inotify_event))
-#define BUF_LEN     (1024 * (EVENT_SIZE + 16))
-
-    char buf[BUF_LEN];
-    int len, i = 0;
-    int file_changed = 0;
-    int status = 0;
-
-    len = read(fd, buf, BUF_LEN);
-    if (len < 0) {
-        if ((errno == EINTR) || (errno == EAGAIN) || (errno == EWOULDBLOCK)) {
-            return (status);
-        } else {
-            ERRLOG("inotify read error (%s)\n", strerror(errno));
-            return (-1);
-        }
+    char *tmpstr = strdup(host_name);
+    char *saveptr, *tok;
+    /* check if fqdn supplied and if yes - prune it */
+    tok = strtok_r(tmpstr, ".", &saveptr);
+    if (!tok) {
+        /* assume only hostname supplied */
+        tok = tmpstr;
     }
-
-    while (i < len) {
-        struct inotify_event *event;
-
-        event = (struct inotify_event *) &buf[i];
-
-        /*
-         * We are only interested in MODIFY events that include the file name
-         * and the file name should match the topology file.
-         */
-        if ((event->mask & IN_MODIFY) && event->len &&
-            (strcmp(event->name, g_topo.graph_file) == 0)) {
-            DLOG("topo file changed\n");
-            file_changed = 1;
-            break;
-        } else {
-            DLOG("ptm_conf recvd (unwanted) inotify event %u\n", event->mask);
-        }
-
-        i += (EVENT_SIZE + event->len);
-    }
-
-    if (file_changed) {
-
-        /*
-         * Remove the watch for a bit since we open the file for building
-         * the graph. Add it back when done with the parsing.
-         */
-        ptm_conf_remove_watch();
-        ptm_conf_reparse_topology();
-        ptm_conf_add_watch();
-    }
-    return (status);
+    free(host_name);
+    return tok;
 }
-
-static void
-ptm_conf_add_watch ()
-{
-    char *dirc, *dir;
-    int wd;
-
-    dirc = strdup(g_topo.graph_file);
-    dir = dirname(dirc);
-    DLOG("adding watch for %s\n", dir);
-    wd = inotify_add_watch(PTM_MODULE_FD(ptm_conf.ptmg, CONF_MODULE), dir,
-                           (IN_MODIFY | IN_MOVE));
-    if (wd < 0) {
-        ERRLOG("inotify_add_watch error (%s)\n", strerror(errno));
-        return;
-    }
-}
-
-static void
-ptm_conf_remove_watch ()
-{
-    int rc;
-
-    DLOG("removing watch\n");
-    rc = inotify_rm_watch(PTM_MODULE_FD(ptm_conf.ptmg, CONF_MODULE),
-                          ptm_conf.file_wd);
-    if (rc < 0) {
-        ERRLOG("inotify_rm_watch error (%s)\n", strerror(errno));
-        return;
-    }
-}
-
-static void
-ptm_conf_init_watch ()
-{
-    int fd;
-
-    fd = inotify_init1(IN_NONBLOCK);
-    if (fd < 0) {
-        ERRLOG("inotify_init error (%s)\n", strerror(errno));
-        return;
-    }
-    PTM_MODULE_SET_FD(ptm_conf.ptmg, fd, CONF_MODULE);
-}
-#endif

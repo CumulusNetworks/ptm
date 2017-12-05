@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Copyright 2014,2015,2016,2017 Cumulus Networks, Inc. All rights reserved.
+#
+# This file is licensed to You under the Eclipse Public License (EPL);
+# You may not use this file except in compliance with the License. You
+# may obtain a copy of the License at
+# http://www.opensource.org/licenses/eclipse-1.0.php
+#
+
+# Your commands to take actions when bfd sess is down
+#
+# Available Env Vars (see man page for more details)
+#
+# $PTM_PORT
+# $PTM_BFDSTATUS
+# $PTM_BFDPEER
+# $PTM_BFDLOCAL
+# $PTM_BFDTYPE
+# $PTM_BFDDIAG
+# $PTM_BFDVRF
+#
+# Eg:
+#
+#logger BFD $PTM_PORT $PTM_BFDSTATUS $PTM_BFDTYPE $PTM_BFDPEER $PTM_BFDVRF

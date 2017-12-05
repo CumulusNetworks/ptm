@@ -1,4 +1,11 @@
-/* Copyright 2013 Cumulus Networks, Inc.  All rights reserved. */
+/* Copyright 2013,2015 Cumulus Networks, LLC.  All rights reserved.
+ * Copyright 2016,2017 Cumulus Networks, Inc.  All rights reserved.
+ *
+ * This file is licensed to You under the Eclipse Public License (EPL);
+ * You may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ * http://www.opensource.org/licenses/eclipse-1.0.php
+ */
 
 #ifndef __PTMCONF__H
 #define __PTMCONF__H
@@ -23,14 +30,10 @@
 #include "ptm_event.h"
 
 #define MAC_ADDR_SIZE 6
-#define MAX_PORTS 257		/* nearest prime */
-#define MAX_NODES 1033		/* nearest prime */
 #define MAX_ARGLEN 512
 
-#define CTL_MSG_SZ 4096
-
-#define EOF_SZ 4
-#define CMD_SZ 256
+#define CTL_MSG_SZ  1024
+#define CMD_SZ      CTL_MSG_SZ
 
 typedef enum {
     PTM_CMD_UNKNOWN,
@@ -42,7 +45,6 @@ typedef enum {
 extern const char const *PTM_CONF_DIR;
 extern const char const *PTM_CONF_FILE;
 extern const char const *PTM_PIDFILE;
-extern const char const *PTM_LOGFILE;
 
 typedef enum {
   PTM_HOST_ID_TYPE_UNKNOWN,
@@ -51,10 +53,33 @@ typedef enum {
 } ptm_conf_host_id_type_t;
 
 typedef enum {
+  PTM_HOST_NAME_TYPE_UNKNOWN,
+  PTM_HOST_NAME_TYPE_HOSTNAME,
+  PTM_HOST_NAME_TYPE_FQDN,
+} ptm_conf_host_name_type_t;
+
+typedef enum {
   PTM_TOPO_STATE_NO_INFO,
   PTM_TOPO_STATE_PASS,
   PTM_TOPO_STATE_FAIL
 } ptm_conf_topo_state_t;
+
+typedef enum {
+  PTM_GET_STATUS_PORT,
+  PTM_GET_STATUS_BFD,
+  PTM_GET_STATUS_LLDP,
+} ptm_conf_get_status_type;
+
+#define PTM_ENV_VAR_PORT        "PTM_PORT"
+#define PTM_ENV_VAR_CBLSTATUS   "PTM_CBL"
+#define PTM_ENV_VAR_EXPNBR      "PTM_EXPNBR"
+#define PTM_ENV_VAR_ACTNBR      "PTM_ACTNBR"
+#define PTM_ENV_VAR_BFDSTATUS   "PTM_BFDSTATUS"
+#define PTM_ENV_VAR_BFDPEER     "PTM_BFDPEER"
+#define PTM_ENV_VAR_BFDLOCAL    "PTM_BFDLOCAL"
+#define PTM_ENV_VAR_BFDTYPE     "PTM_BFDTYPE"
+#define PTM_ENV_VAR_BFDDOWNDIAG "PTM_BFDDIAG"
+#define PTM_ENV_VAR_BFDVRF      "PTM_BFDVRF"
 
 #ifndef TRUE
 #define TRUE                  1
@@ -64,57 +89,21 @@ typedef enum {
 #define FALSE                 0
 #endif
 
-
-struct ptm_conf_nbr {
-  char sys_name[MAXNAMELEN+1];
-  char port_ident[MAXNAMELEN+1]; /* could be port name or description */
-  time_t last_change_time;
-};
-
-typedef enum {
-  PTM_NBR_CMP_PORT,
-  PTM_NBR_CMP_MAC,
-  PTM_NBR_CMP_IP
-} ptm_conf_nbr_cmp_attr_t;
-
 typedef struct ptm_conf_port {
   char port_name[MAXNAMELEN+1];
   unsigned int en_mods;      /* bit vector for modules enabled on node */
   ptm_conf_topo_state_t topo_oper_state;
-  ptm_conf_nbr_cmp_attr_t cmp_attr;
-  struct ptm_conf_nbr admin;
+  char nbr_sysname[MAXNAMELEN+1];
+  char nbr_ident[MAXNAMELEN+1]; /* could be port name or description */
   char mac_addr[MAC_ADDR_SIZE];
-  int num_transitions;
   UT_hash_handle ph; /* UThash handle look up local ports */
-  UT_hash_handle nh; /* UThash handle look up node ports */
 } ptm_conf_port_t;
-
-struct ptm_conf_node {
-  char node_name[MAXNAMELEN+1];
-  char mgmt_ip_addr[INET6_ADDRSTRLEN+1];
-  ptm_conf_host_id_type_t id_type;
-  int  state;
-  struct ptm_conf_port *ports;
-};
-
-struct ptm_conf_network {
-  char graph_file[MAXNAMELEN+1];
-  struct ptm_conf_node *nodes;
-  struct ptm_conf_node me;
-  time_t last_access_time;
-  time_t last_good_access_time;
-};
 
 /**
  * Function to initialize the CONF_MODULE in ptmd. Given the topology
  * file, it builds the graph and initializes the node/port table.
  */
 int ptm_conf_init(ptm_globals_t *);
-
-/**
- * Function to parse the graph and call module handlers
- */
-int ptm_conf_reparse(ptm_globals_t *g);
 
 /**
  * Function invoked whenever there is a new (control) client connected
@@ -135,7 +124,7 @@ int ptm_conf_reparse_topology(ptm_globals_t *);
 void ptm_conf_finish(void);
 
 /**
- * Get configured check parameters for a port 
+ * Get configured check parameters for a port
  */
 struct ptm_conf_port *ptm_conf_get_port(ptm_event_t *);
 struct ptm_conf_port *ptm_conf_get_port_by_name(char *port_name);
@@ -145,15 +134,15 @@ struct ptm_conf_port *ptm_conf_get_port_by_name(char *port_name);
  */
 int ptm_conf_is_mod_enabled(struct ptm_conf_port *port, ptm_module_e mod);
 
-/** 
- * Signal to listeners about change in topology 
+/**
+ * Signal to listeners about change in topology
  */
-void ptm_conf_topo_action (struct ptm_conf_port *port, bool pass);
+void ptm_conf_topo_action (void *p_ctxt, bool pass);
 
 /**
- * process a client query
+ * process a client cmd
  */
-void ptm_conf_process_client_query (ptm_event_t *);
+int ptm_conf_process_client_cmd (void *, void *);
 
 /**
  * find key/val in attribute list of edge
@@ -161,8 +150,48 @@ void ptm_conf_process_client_query (ptm_event_t *);
 void ptm_conf_find_key_val(char *key_arg, char *args, char *val);
 
 /**
+ * find the next key/val in attribute list of edge
+ */
+void ptm_conf_find_next_key_val(char *args, char *key, char *val);
+
+/**
  * find template attribute and return attribute list
  */
 void ptm_conf_get_template_str(char *tmpl_key, char *tmpl_str);
+
+/**
+ * get the global hostname match type
+ */
+int ptm_conf_get_hostname_type (void);
+
+/**
+ * prune hostname from fqdn (if present)
+ */
+char *ptm_conf_prune_hostname(char *host_name);
+
+/**
+ * notify status to clients
+ */
+void ptm_conf_notify_status_all_clients(void *, char *, int, int);
+
+/**
+ * return ptm configuration path
+ */
+char *ptm_conf_get_conf_dir(void);
+
+/**
+ * send command status
+ */
+void ptm_conf_ctl_cmd_status (ptm_client_t *client, void *, char *, char *);
+
+/**
+ * ulong parse helper function
+ */
+int ptm_conf_parse_ulong_parm(char *val);
+
+/**
+ * msec parse helper function
+ */
+int ptm_conf_parse_msec_parm(char *val);
 
 #endif
